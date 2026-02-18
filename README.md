@@ -17,37 +17,68 @@ Google Colab版の当直表自動生成コードをローカル実行用に変�
 
 ## 前提条件
 
-- Python 3.10 以上
-- pip（パッケージ管理ツール）
+- macOS (Mac)
+- Python 3.10 以上（なければスクリプトが案内を表示します）
 
-## セットアップ手順
+## Mac でワンクリック実行（推奨）
 
-### 1. リポジトリのクローン
+### 方法1: ターミナルにコピー＆ペースト
+
+以下をターミナルにコピー＆ペーストするだけで、セットアップから実行まで全自動で行います。
+
+**初回（リポジトリのダウンロードから）:**
 
 ```bash
-git clone <リポジトリURL>
+git clone https://github.com/tomitayus/Tochoku-kun.git && cd Tochoku-kun && bash run.sh
+```
+
+**2回目以降（すでにダウンロード済みの場合）:**
+
+```bash
+cd Tochoku-kun && bash run.sh
+```
+
+スクリプトが自動的に以下を実行します:
+1. Python 3 の確認
+2. 仮想環境の作成（初回のみ）
+3. 依存パッケージのインストール（初回のみ）
+4. **Excelファイルの選択ダイアログを自動表示**
+5. 当直表の生成
+6. 結果を `~/Downloads/` に保存
+
+### 方法2: ダブルクリックで実行
+
+リポジトリ内の `当直くん.command` をダブルクリックするだけで実行できます。
+
+> **初回のみ**: macOS が「開発元が未確認」と警告する場合は、
+> ファイルを右クリック → 「開く」を選択してください。
+
+### 方法3: 手動セットアップ
+
+<details>
+<summary>手動でセットアップする場合（上級者向け）</summary>
+
+#### 1. リポジトリのクローン
+
+```bash
+git clone https://github.com/tomitayus/Tochoku-kun.git
 cd Tochoku-kun
 ```
 
-### 2. 仮想環境の作成
+#### 2. 仮想環境の作成
 
 ```bash
 python3 -m venv .venv
-
-# macOS/Linux:
 source .venv/bin/activate
-
-# Windows:
-.venv\Scripts\activate
 ```
 
-### 3. 依存パッケージのインストール
+#### 3. 依存パッケージのインストール
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. データの配置
+#### 4. データの配置
 
 `data/` フォルダに当直表のExcelファイルを配置してください。
 
@@ -56,8 +87,9 @@ data/
 └── Tochoku.xlsx   ← ここに配置
 ```
 
+</details>
+
 **注意:** `data/` フォルダ内のExcel/CSVファイルはGitに含まれません（個人情報保護のため）。
-手動で配置する必要があります。
 
 ### Excelファイルの構造
 
@@ -133,6 +165,8 @@ NUM_PATTERNS = 1000
 
 ```
 Tochoku-kun/
+├── run.sh                     # ワンクリック実行スクリプト（推奨）
+├── 当直くん.command             # ダブルクリック実行用（macOS）
 ├── main.py                    # メイン実行スクリプト
 ├── config.py                  # 設定ファイル（月ごとに編集）
 ├── requirements.txt           # Python依存パッケージ

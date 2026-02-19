@@ -1,281 +1,187 @@
-# 当直くん - 医師当直スケジュール自動生成システム
+# 当直くん - 医師当直スケジュール自動生成ツール
 
-Google Colab版をWebアプリケーション化したプロジェクトです。
+Google Colab版の当直表自動生成コードをローカル実行用に変換したプロジェクトです。
 
-## 📋 概要
+## 概要
 
-医師の当直スケジュールを、複数の制約条件を考慮して自動生成するシステムです。
+医師の当直スケジュールを、複数の制約条件を考慮して自動生成するツールです。
 
 ### 主な機能
 
-- ✅ 複数の制約を考慮した自動割当（可否、カテ表、gap、cap等）
-- ✅ Greedy + 局所探索による最適化
-- ✅ 複数パターン生成（100〜10000パターン）
-- ✅ TOP3パターンの出力
-- ✅ 診断情報の自動生成（gap違反、重複、偏り等）
-- ✅ 前月累積データの考慮
+- 複数の制約を考慮した自動割当（可否、カテ表、gap、cap等）
+- Greedy + 局所探索による最適化
+- 複数パターン生成（100〜10000パターン）
+- TOP3パターンの出力（公平性/gap回避/バランスの3軸評価）
+- 診断情報の自動生成（gap違反、重複、偏り等）
+- 前月累積データの考慮
 
-## 🏗️ アーキテクチャ
+## 前提条件
 
-```
-┌─────────────┐         ┌──────────────┐         ┌─────────────┐
-│  Frontend   │  HTTP   │   FastAPI    │         │  Scheduler  │
-│  (HTML/JS)  │ ──────> │   Backend    │ ──────> │   Logic     │
-└─────────────┘         └──────────────┘         └─────────────┘
-                              │
-                              v
-                        ┌──────────────┐
-                        │ pandas/numpy │
-                        │   openpyxl   │
-                        └──────────────┘
-```
+- Python 3.10 以上
+- pip（パッケージ管理ツール）
 
-## 📦 ディレクトリ構造
+## セットアップ手順
 
-```
-duty-roster-scheduler/
-├── backend/
-│   ├── app.py              # FastAPI エントリーポイント
-│   ├── scheduler.py        # スケジューリングロジック（※要完成）
-│   └── requirements.txt    # Python依存パッケージ
-├── frontend/
-│   └── index.html          # Webインターフェース
-├── docs/
-│   ├── BUGS_AND_ISSUES.md  # バグ・問題点の一覧
-│   └── WEB_MIGRATION_PLAN.md  # Web化の詳細設計
-├── .gitignore
-└── README.md
-```
-
-## 🚀 クイックスタート
-
-### 必要環境
-
-- Python 3.10以上
-- 現代的なWebブラウザ（Chrome, Firefox, Safari, Edge等）
-
-### 1. バックエンドのセットアップ
+### 1. リポジトリのクローン
 
 ```bash
-cd backend
+git clone <リポジトリURL>
+cd Tochoku-kun
+```
 
-# 仮想環境作成
-python -m venv venv
+### 2. 仮想環境の作成
 
-# 仮想環境の有効化
-# Windows:
-venv\Scripts\activate
+```bash
+python3 -m venv .venv
+
 # macOS/Linux:
-source venv/bin/activate
+source .venv/bin/activate
 
-# 依存パッケージのインストール
+# Windows:
+.venv\Scripts\activate
+```
+
+### 3. 依存パッケージのインストール
+
+```bash
 pip install -r requirements.txt
-
-# サーバー起動
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 2. フロントエンドの起動
+### 4. データの配置
 
-別のターミナルで：
+`data/` フォルダに当直表のExcelファイルを配置してください。
+
+```
+data/
+└── Tochoku.xlsx   ← ここに配置
+```
+
+**注意:** `data/` フォルダ内のExcel/CSVファイルはGitに含まれません（個人情報保護のため）。
+手動で配置する必要があります。
+
+### Excelファイルの構造
+
+入力Excelファイルには以下のシートが必要です：
+
+| シート名 | 内容 |
+|---------|------|
+| sheet1 | シフト表（日付 + 病院列、枠は`1`で表記） |
+| sheet2 | 医師の可否（0=不可, 1=可, 2=B〜Mのみ, 3=H〜Uのみ） |
+| sheet3 | カテ表（省略可：Sheet1:Z + Sheet4:属性で代替） |
+| sheet4 | 前月までの累積データ（氏名、全合計、大学合計、外病院合計 等） |
+
+`data/sample_staff.csv` にsheet4の構造のサンプルがあります。
+
+## 実行方法
+
+### 基本的な実行
 
 ```bash
-cd frontend
-
-# 簡易HTTPサーバー起動
-# Python 3の場合
-python -m http.server 8080
-
-# または、VSCodeのLive Server拡張機能を使用
+python main.py
 ```
 
-### 3. ブラウザでアクセス
+`config.py` で設定した `INPUT_FILE`（デフォルト: `data/Tochoku.xlsx`）を読み込み、
+結果を `data/output/` に出力します。
 
-```
-http://localhost:8080
-```
-
-## 📝 使い方
-
-1. **Excelファイルを準備**
-   - sheet1: シフト表（日付 + 病院列）
-   - sheet2: 医師の可否（0=不可, 1=可, 2=B〜Mのみ, 3=H〜Uのみ）
-   - sheet3: カテ表
-   - sheet4: 前月までの累積データ
-
-2. **ファイルをアップロード**
-   - ドラッグ&ドロップ または クリックして選択
-
-3. **設定を調整**（オプション）
-   - パターン数: 100〜10000（推奨: 1000）
-   - 局所探索: 有効推奨
-   - 祝日: YYYY-MM-DD形式で入力
-   - 水曜禁止医師: カンマ区切りで入力
-
-4. **生成開始**
-   - 「スケジュールを生成」ボタンをクリック
-   - 進捗バーで処理状況を確認
-
-5. **結果ダウンロード**
-   - 完了後、Excelファイルをダウンロード
-   - TOP3パターン + 診断シートが含まれます
-
-## 🐛 既知の問題
-
-詳細は [BUGS_AND_ISSUES.md](docs/BUGS_AND_ISSUES.md) を参照
-
-### 主な未修正バグ
-
-1. **scheduler.py が未完成**
-   - 現在、データ読み込み部分のみ実装
-   - スケジュール生成ロジック（greedy + local search）は元のColabコードから移植が必要
-
-2. **列インデックスのハードコーディング**
-   - B〜U列の想定が固定的
-   - 列名から動的に取得する必要あり
-
-3. **医師名の正規化不足**
-   - 全角/半角スペースで制約が効かない可能性
-
-### 回避策
-
-- 現時点では **オリジナルのColab版** を使用することを推奨
-- Web版は開発中（scheduler.pyの移植が必要）
-
-## 🔧 開発ガイド
-
-### scheduler.pyの完成方法
-
-元のColabコードから以下の関数を移植：
-
-1. `build_schedule_pattern()` - greedy割当
-2. `local_search_swap()` - 局所探索
-3. `evaluate_schedule_with_raw()` - スコア計算
-4. `build_summaries()` - サマリー生成
-5. `build_diagnostics()` - 診断情報生成
-
-**移植時の注意点**:
-- グローバル変数を `self.XXX` に変更
-- `files.upload()` / `files.download()` の削除
-- エラーハンドリングの追加
-- 型ヒントの追加
-
-### テスト方法
+### 入力ファイルを指定して実行
 
 ```bash
-# サンプルデータでテスト
-pytest tests/test_scheduler.py
-
-# カバレッジ測定
-pytest --cov=backend tests/
+python main.py data/2026年4月当直表.xlsx
 ```
 
-## 📊 API仕様
+### 出力
 
-### POST /api/schedule/generate
+`data/output/` に以下の形式のExcelファイルが生成されます：
 
-スケジュール生成を開始
-
-**Request**:
-- `file`: Excelファイル（multipart/form-data）
-- `config`: 設定（JSON文字列、オプション）
-
-**Response**:
-```json
-{
-  "task_id": "uuid-xxxx",
-  "status": "processing",
-  "progress": 0
-}
+```
+data/output/Tochoku_v6.5.6.xlsx
 ```
 
-### GET /api/schedule/status/{task_id}
+ファイル内のシート構成：
+- `pattern_01`: スケジュールパターン1（公平性重視）
+- `pattern_01_summary`: パターン1のサマリー・診断
+- `pattern_02`: スケジュールパターン2（gap回避重視）
+- `pattern_02_summary`: パターン2のサマリー・診断
+- `pattern_03`: スケジュールパターン3（バランス重視）
+- `pattern_03_summary`: パターン3のサマリー・診断
 
-タスクのステータスを取得
+## config.py の編集方法
 
-**Response**:
-```json
-{
-  "task_id": "uuid-xxxx",
-  "status": "completed",
-  "progress": 100,
-  "result_url": "/api/schedule/download/uuid-xxxx"
-}
+月次運用では `config.py` のみ編集すればOKです。
+
+### 主な設定項目
+
+```python
+# 入力ファイルパス
+INPUT_FILE = "data/Tochoku.xlsx"
+
+# 祝日（対象月のものを追加）
+HOLIDAYS = [
+    "2026-04-29",  # 昭和の日
+]
+
+# 水曜H〜U禁止医師
+WED_FORBIDDEN_DOCTORS = ["金城", "山田", "野寺"]
+
+# 生成パターン数（推奨: 1000）
+NUM_PATTERNS = 1000
 ```
 
-### GET /api/schedule/download/{task_id}
+詳細は `config.py` のコメントを参照してください。
 
-結果のExcelファイルをダウンロード
+## ディレクトリ構成
 
-**Response**: Excelファイル（binary）
-
-## 🚢 デプロイ
-
-### Dockerを使用
-
-```bash
-# ビルド
-docker build -t duty-scheduler backend/
-
-# 実行
-docker run -p 8000:8000 duty-scheduler
+```
+Tochoku-kun/
+├── main.py                    # メイン実行スクリプト
+├── config.py                  # 設定ファイル（月ごとに編集）
+├── requirements.txt           # Python依存パッケージ
+├── .gitignore                 # Git除外設定
+├── README.md                  # このファイル
+├── colab_duty_scheduler.py    # 元のColabコード（参照用）
+├── VERSION_HISTORY.md         # バージョン履歴
+├── data/
+│   ├── .gitkeep
+│   ├── sample_staff.csv       # サンプルデータ（sheet4の構造参考）
+│   └── output/                # 出力先（自動作成）
+│       └── .gitkeep
+├── backend/                   # Web版バックエンド（開発中）
+├── frontend/                  # Web版フロントエンド（開発中）
+└── docs/                      # ドキュメント
 ```
 
-### Render.com（推奨）
+## 制約体系
 
-1. GitHubリポジトリに push
-2. Render.com でWeb Serviceを作成
-3. Build Command: `pip install -r requirements.txt`
-4. Start Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+### 絶対禁忌（ABS）: 配置不可
+- ABS-001: 可否コード0禁止
+- ABS-002: コード2の列制約（B〜M列のみ）
+- ABS-003: コード3の列制約（H〜U列のみ）
+- ABS-004: カテ当番日の外病院禁止
+- ABS-005: 水曜日外病院禁止医師
+- ABS-006: 同日重複禁止
+- ABS-007: gap3日未満禁止
+- ABS-008: 同一外病院重複禁止
+- ABS-013: C-H列カテ当番必須
 
-### フロントエンド（静的サイト）
+### ソフト制約（SOFT）: ペナルティ
+- 公平性（max-min最小化）
+- コード1.2の大学系最低1回
+- 大学/外病院バランス
 
-- Netlify / Vercel / GitHub Pages で公開
-- `index.html` の `API_BASE` を本番URLに変更
+詳細は `docs/CONSTRAINT_RULES.md` を参照してください。
 
-## 🔐 セキュリティ
+## トラブルシューティング
 
-### 本番環境での注意点
+### 「入力ファイルが見つかりません」エラー
+→ `data/` フォルダにExcelファイルを配置し、`config.py` の `INPUT_FILE` パスを確認してください。
 
-1. **CORS設定を制限**
-   ```python
-   allow_origins=["https://yourdomain.com"]
-   ```
+### 「必要なシートが見つかりません」エラー
+→ Excelファイル内のシート名が `sheet1`, `sheet2`, `sheet3`, `sheet4` であることを確認してください（大文字小文字は問いません）。
 
-2. **ファイルサイズ制限**
-   - 現在: 10MB
-   - 必要に応じて調整
+### tqdmがインストールされていない警告
+→ `pip install tqdm` を実行してください。進捗バーなしでも動作します。
 
-3. **タスク管理をRedis/DBに変更**
-   - 現在はメモリ上（再起動で消える）
+## Web版について
 
-4. **認証・認可の追加**
-   - 現在は未実装
-   - OAuth2 / JWT の検討
-
-## 📚 参考資料
-
-- [FastAPI Documentation](https://fastapi.tiangolo.com/)
-- [pandas Documentation](https://pandas.pydata.org/docs/)
-- [openpyxl Documentation](https://openpyxl.readthedocs.io/)
-
-## 📄 ライセンス
-
-（プロジェクトに応じて設定）
-
-## 🤝 コントリビューション
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📧 お問い合わせ
-
-（連絡先を記載）
-
----
-
-**注意**: 現在、`scheduler.py` のスケジュール生成ロジックは未実装です。
-本番利用前に、元のColabコードからの移植が必要です。
+`backend/` と `frontend/` ディレクトリにWeb版のコードがありますが、現在開発中です。
+ローカルCLI版（`main.py`）の使用を推奨します。

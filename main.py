@@ -1,19 +1,7 @@
-# @title 当直くん v6.7.0 (サマリーシートv2レイアウト)
+# 当直くん v6.5.6 - ローカル実行版
+# 元のGoogle Colabノートブックをローカル実行用に変換したものです。
+# 詳細なバージョン履歴は VERSION_HISTORY.md を参照してください。
 # 修正内容:
-# v6.7.0 (2026-02-13):
-# - サマリーシートを2カラムレイアウトにリニューアル
-#   - 左上にスコアサマリー（条件付き色分け付き）
-#   - 右側に今月サマリー（医師別割当数）
-#   - 制約違反セクションを圧縮（空→1行「違反なし✓」、件数>0のみ詳細展開）
-#   - 累計詳細テーブルに2段グループヘッダー追加（大学系/支援/夜間急病/外病院）
-#   - 0値グレーアウト、上位3値太字、ゼブラストライプ
-#   - 列幅最適化、フリーズペイン設定
-# v6.6.0 (2026-02-13):
-# - 休み希望ありの医師を優先的に制約緩和するアルゴリズムを追加
-#   - sheet2でcode 0の日が1日以上ある医師を「休み希望あり」と判定
-#   - 各緩和段階で休み希望ありの医師を先に緩和対象にする
-#   - 段階的制約緩和を4段階→7段階に拡張
-#   - collect_candidatesにonly_with_timeoffパラメータを追加
 # v6.5.6 (2026-02-06):
 # - SEMI-001の緩和可否を属性で判定
 #   - カテ持ち + 属性1: 緩和可（週1回まで許容）
@@ -342,15 +330,15 @@
 # - エラーハンドリングの改善
 
 import io
+import sys
+import os
 import pandas as pd
 import numpy as np
 from collections import defaultdict
 import random
-import importlib.util
-import os
 
 # バージョン定数
-VERSION = "6.7.0"
+VERSION = "6.5.6"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -361,30 +349,28 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
-COLAB_AVAILABLE = (
-    importlib.util.find_spec("google") is not None
-    and importlib.util.find_spec("google.colab") is not None
-)
-if COLAB_AVAILABLE:
-    from google.colab import files
+# ローカル実行専用（Google Colab固有コードを除去）
+COLAB_AVAILABLE = False
 
 # =========================
-# ユーザー設定
+# config.py から設定を読み込み
 # =========================
-HOLIDAYS = set()  # 祝日を入れるならここ（例: {pd.Timestamp("2026-01-01"), ...}）
-BG_DAY_COLS = set()    # 列名で「昼」固定したい大学枠があれば追加
-BG_NIGHT_COLS = set()  # 列名で「夜」固定したい大学枠があれば追加
+import config as _cfg
 
-WED_FORBIDDEN_DOCTORS = {'金城', '山田', '野寺'}  # 水曜の H〜U を禁止したい医師
+HOLIDAYS = set()  # 後で pd.Timestamp に正規化する
+BG_DAY_COLS = set()
+BG_NIGHT_COLS = set()
 
-NUM_PATTERNS = int(os.getenv("NUM_PATTERNS", "1000"))  # デフォルト1000パターン（v6.5.7: 100→1000に増加、大学系週1違反削減のため）
+WED_FORBIDDEN_DOCTORS = set(_cfg.WED_FORBIDDEN_DOCTORS)
+
+NUM_PATTERNS = _cfg.NUM_PATTERNS
 
 # sheet1 の「枠」扱いする入力値（1以外の記号も許容したい場合）
 SLOT_MARKERS = {1, 1.0, "1", "〇", "○", "◯", "◎"}
 
 # --- ローカル探索（入替）設定 ---
-LOCAL_SEARCH_ENABLED = False   # v5.7.1: 局所探索は無効のまま
-OPTIMIZATION_ENABLED = True    # v6.0.3: safe_fixラッパーで再有効化（ABS違反増加時はrevert）
+LOCAL_SEARCH_ENABLED = _cfg.LOCAL_SEARCH_ENABLED
+OPTIMIZATION_ENABLED = _cfg.OPTIMIZATION_ENABLED
 TOP_KEEP = 20                 # greedyで残す候補数（100パターンから上位20候補を保持）
 REFINE_TOP = 15               # ローカル探索をかける候補数（上位15候補を最適化）
 LOCAL_MAX_ITERS = 3000        # 1候補あたりの入替試行回数
@@ -393,20 +379,20 @@ LOCAL_REFRESH_EVERY = 200     # 問題医師（gap/重複）を再抽出する�
 
 # v6.0.0 スコア重み（ソフト制約のみ）
 # 絶対禁忌(ABS)とハード制約(HARD)は候補選定時にチェック済み
-W_FAIR_TOTAL = 30          # SOFT-001: 公平性（max-min最小化）
-W_CODE_12_UNIV = 150       # SOFT-002: コード1.2優先（大学系0回ペナルティ）
-W_BG_HT_DIFF = 100         # SOFT-003: 大学/外病院差（差3以上ペナルティ）
+W_FAIR_TOTAL = getattr(_cfg, 'W_FAIR_TOTAL', 30)
+W_CODE_12_UNIV = getattr(_cfg, 'W_CODE_12_UNIV', 150)
+W_BG_HT_DIFF = getattr(_cfg, 'W_BG_HT_DIFF', 100)
 # 以下は絶対禁忌のためペナルティ不要（v6.0.0）
 W_GAP = 0                  # ABS-007で対応
 W_HOSP_DUP = 0             # ABS-008で対応
 W_EXTERNAL_HOSP_DUP = 0    # ABS-008で対応
-W_UNASSIGNED = 500         # v6.0.2: 未割当ペナルティ（fix_unassigned_slots有効化に伴い復活）
+W_UNASSIGNED = getattr(_cfg, 'W_UNASSIGNED', 500)
 W_CAP = 0                  # ABS-010で対応
 W_BG_SPREAD = 0            # 削除（簡略化）
 W_HT_SPREAD = 0            # 削除（簡略化）
 W_WD_SPREAD = 0            # 削除（簡略化）
 W_WE_SPREAD = 0            # 削除（簡略化）
-W_BK_LY_BALANCE = 2        # B-K/L-Y の比率バランス（なるべく1:1）
+W_BK_LY_BALANCE = getattr(_cfg, 'W_BK_LY_BALANCE', 2)
 
 # =========================
 # 制約ID定義（v5.2仕様書準拠）
@@ -551,103 +537,82 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
     return data
 
 # =========================
-# 入力ファイルのアップロード
+# 入力ファイルの読み込み（ローカル実行）
 # =========================
 print("\n" + "="*60)
-print(f"  📂 当直くん v{VERSION}")
+print(f"  当直くん v{VERSION} (ローカル実行)")
 print("="*60)
-print("\nsheet1〜sheet4が入った当直Excelファイルを選択してください")
 
-if COLAB_AVAILABLE:
-    uploaded = files.upload()
-    uploaded_filename = list(uploaded.keys())[0]
-
-    try:
-        xls = pd.ExcelFile(io.BytesIO(uploaded[uploaded_filename]))
-    except Exception as e:
-        raise ValueError(f"❌ Excelファイルの読み込みに失敗しました: {e}")
-
-    sheet1_name = find_sheet_name(xls, "sheet1")
-    sheet2_name = find_sheet_name(xls, "sheet2")
-    sheet3_name = find_sheet_name(xls, "sheet3")
-    sheet4_name = find_sheet_name(xls, "sheet4") or find_sheet_name(xls, "Sheet4")
-
-    # v6.5.0: 新しいExcel構造対応
-    # Sheet4がない場合はSheet3を医師情報シートとして使用（旧Sheet3のカテ表は廃止）
-    if sheet4_name is None and sheet3_name is not None:
-        sheet4_name = sheet3_name
-        sheet3_name = None  # 旧カテ表は使用しない
-
-    missing = [k for k, v in [("sheet1", sheet1_name), ("sheet2", sheet2_name), ("sheet4/医師情報", sheet4_name)] if v is None]
-    if missing:
-        raise ValueError(f"❌ 必要なシートが見つかりません: {missing}\n実際のシート名: {xls.sheet_names}")
-
-    # --------- Excel 読み込み ---------
-    shift_df = strip_cols(pd.read_excel(xls, sheet_name=sheet1_name))
-    availability_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet2_name))
-
-    # v6.5.0: 旧カテ表(Sheet3)がない場合は空のDataFrameを使用
-    if sheet3_name is not None:
-        schedule_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet3_name))
-        schedule_raw.columns = make_unique(list(schedule_raw.columns))
-    else:
-        # カテ表はSheet1:Z + Sheet4:属性で代替するため空でOK
-        schedule_raw = pd.DataFrame()
-        # 旧カテ表不使用（Sheet1:Z + Sheet4:属性で判定）
-
-    shift_df.columns = make_unique(list(shift_df.columns))
-    availability_raw.columns = make_unique(list(availability_raw.columns))
-
-    # sheet4 は「出力用」と「解析用（header=None）」を分ける
-    sheet4_raw_out = strip_cols(pd.read_excel(xls, sheet_name=sheet4_name))
-    sheet4_raw_out.columns = make_unique(list(sheet4_raw_out.columns))
-
-    sheet4_grid = pd.read_excel(xls, sheet_name=sheet4_name, header=None)
-    sheet4_data = parse_sheet4_from_grid(sheet4_grid)
+# 入力ファイルパスの決定（Finderダイアログ > コマンドライン引数 > config.py）
+if len(sys.argv) > 1:
+    input_path = sys.argv[1]
 else:
-    from tochoku_data_complete import DATA as LOCAL_DATA
+    try:
+        import subprocess as _sp
+        _result = _sp.run(
+            ["osascript", "-e",
+             'POSIX path of (choose file with prompt "入力Excelファイルを選択してください" of type {"xlsx", "xls"})'],
+            capture_output=True, text=True, timeout=300,
+        )
+        if _result.returncode == 0 and _result.stdout.strip():
+            input_path = _result.stdout.strip()
+        else:
+            print("\nファイルが選択されませんでした。終了します。")
+            sys.exit(0)
+    except Exception:
+        input_path = _cfg.INPUT_FILE
 
-    uploaded_filename = "Tochoku.local.xlsx"
-    shift_df = strip_cols(pd.DataFrame(LOCAL_DATA["sheet1"]))
-    availability_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet2"]))
+if not os.path.exists(input_path):
+    print(f"\nエラー: 入力ファイルが見つかりません: {input_path}")
+    print(f"data/ フォルダにExcelファイルを配置してください。")
+    print(f"使い方: python main.py [入力ファイルパス]")
+    sys.exit(1)
 
-    # v6.5.8: LOCAL_DATAパスでも新構造(v7)に対応
-    # Sheet4がない場合、Sheet3を医師情報シートとして使用（Colabパスと同じ）
-    has_sheet4 = "Sheet4" in LOCAL_DATA and LOCAL_DATA["Sheet4"]
-    has_sheet3 = "sheet3" in LOCAL_DATA and LOCAL_DATA["sheet3"]
+print(f"\n入力ファイル: {input_path}")
 
-    if has_sheet4:
-        schedule_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"])) if has_sheet3 else pd.DataFrame()
-        sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["Sheet4"]))
-    elif has_sheet3:
-        # Sheet4がない場合: Sheet3を医師情報シートとして使用
-        sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"]))
-        schedule_raw = pd.DataFrame()  # 旧カテ表は使用しない
-    else:
-        schedule_raw = pd.DataFrame()
-        sheet4_raw_out = pd.DataFrame(columns=["氏名"])
+uploaded_filename = os.path.basename(input_path)
 
-    shift_df.columns = make_unique(list(shift_df.columns))
-    availability_raw.columns = make_unique(list(availability_raw.columns))
-    if len(schedule_raw.columns) > 0:
-        schedule_raw.columns = make_unique(list(schedule_raw.columns))
+try:
+    xls = pd.ExcelFile(input_path)
+except Exception as e:
+    raise ValueError(f"Excelファイルの読み込みに失敗しました: {e}")
 
-    sheet4_raw_out.columns = make_unique(list(sheet4_raw_out.columns))
+sheet1_name = find_sheet_name(xls, "sheet1")
+sheet2_name = find_sheet_name(xls, "sheet2")
+sheet3_name = find_sheet_name(xls, "sheet3")
+sheet4_name = find_sheet_name(xls, "sheet4") or find_sheet_name(xls, "Sheet4")
 
-    # Sheet4が「氏名」列を含むか確認（新構造ではgrid形式の可能性あり）
-    if "氏名" not in sheet4_raw_out.columns:
-        # grid形式の場合はparse_sheet4_from_gridを試行
-        try:
-            sheet4_data = parse_sheet4_from_grid(sheet4_raw_out)
-        except Exception:
-            raise ValueError("❌ Sheet4 の '氏名' 列が見つかりません（ローカルデータを確認してください）")
-    else:
-        sheet4_data = sheet4_raw_out.copy()
-    sheet4_data["氏名"] = sheet4_data["氏名"].astype(str).str.strip()
-    for col in sheet4_data.columns:
-        if col == "氏名":
-            continue
-        sheet4_data[col] = pd.to_numeric(sheet4_data[col], errors="coerce").fillna(0)
+# v6.5.0: 新しいExcel構造対応
+# Sheet4がない場合はSheet3を医師情報シートとして使用（旧Sheet3のカテ表は廃止）
+if sheet4_name is None and sheet3_name is not None:
+    sheet4_name = sheet3_name
+    sheet3_name = None  # 旧カテ表は使用しない
+
+missing = [k for k, v in [("sheet1", sheet1_name), ("sheet2", sheet2_name), ("sheet4/医師情報", sheet4_name)] if v is None]
+if missing:
+    raise ValueError(f"必要なシートが見つかりません: {missing}\n実際のシート名: {xls.sheet_names}")
+
+# --------- Excel 読み込み ---------
+shift_df = strip_cols(pd.read_excel(xls, sheet_name=sheet1_name))
+availability_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet2_name))
+
+# v6.5.0: 旧カテ表(Sheet3)がない場合は空のDataFrameを使用
+if sheet3_name is not None:
+    schedule_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet3_name))
+    schedule_raw.columns = make_unique(list(schedule_raw.columns))
+else:
+    # カテ表はSheet1:Z + Sheet4:属性で代替するため空でOK
+    schedule_raw = pd.DataFrame()
+
+shift_df.columns = make_unique(list(shift_df.columns))
+availability_raw.columns = make_unique(list(availability_raw.columns))
+
+# sheet4 は「出力用」と「解析用（header=None）」を分ける
+sheet4_raw_out = strip_cols(pd.read_excel(xls, sheet_name=sheet4_name))
+sheet4_raw_out.columns = make_unique(list(sheet4_raw_out.columns))
+
+sheet4_grid = pd.read_excel(xls, sheet_name=sheet4_name, header=None)
+sheet4_data = parse_sheet4_from_grid(sheet4_grid)
 
 # =========================
 # 日付列の整形
@@ -671,6 +636,9 @@ else:
     schedule_df = pd.DataFrame()
     date_col_sched = None
 
+# config.py の祝日をセットに追加
+for _h in _cfg.HOLIDAYS:
+    HOLIDAYS.add(pd.Timestamp(_h))
 # 🔧 FIX: 祝日もタイムゾーン正規化
 HOLIDAYS = {pd.to_datetime(d).normalize().tz_localize(None) for d in HOLIDAYS}
 
@@ -1077,18 +1045,6 @@ if len(active_doctors) == 0:
 if inactive_doctors:
     print(f"⚠️ inactive医師（解析除外、出力のみ）: {len(inactive_doctors)}人")
 
-# v6.6.0: 休み希望数（code 0の日数）を医師ごとに事前計算
-# 制約緩和時、休み希望ありの医師を優先的に緩和対象にするために使用
-doctor_timeoff_count = {}
-for doc in active_doctors:
-    doctor_timeoff_count[doc] = sum(
-        1 for d in all_shift_dates if get_avail_code(d, doc) == 0
-    )
-doctors_with_timeoff = {doc for doc, cnt in doctor_timeoff_count.items() if cnt > 0}
-_n_with = len(doctors_with_timeoff)
-_n_without = len(active_doctors) - _n_with
-print(f"ℹ️ 休み希望: あり {_n_with}人 / なし {_n_without}人")
-
 # 可否コード2の医師（大学系のみ可能）
 # v6.0.5: CODE_2医師もEXTRA枠対象に含める（除外すると物理的に枠不足になりうる）
 def has_code_2_anywhere(doc):
@@ -1427,17 +1383,9 @@ def choose_doctor_for_slot(
         relax_semi=False,  # v6.0.0: SEMI制約を緩和（sheet3「1」以外も許容）
         relax_hard=False,  # v6.0.1: HARD制約を緩和（ABS-009回避のため）
         relax_abs=False,   # v6.3.0: ABS制約を緩和（未割当回避のため）
-        only_with_timeoff=False,  # v6.6.0: 休み希望ありの医師のみを緩和対象にする
     ):
         candidates = []
         for doc in doctor_names:
-            # v6.6.0: only_with_timeoff=Trueの場合、休み希望なしの医師は
-            # 緩和前の制約で評価する（緩和対象にしない）
-            doc_has_timeoff = doc in doctors_with_timeoff
-            eff_relax_semi = relax_semi if (doc_has_timeoff or not only_with_timeoff) else False
-            eff_relax_hard = relax_hard if (doc_has_timeoff or not only_with_timeoff) else False
-            eff_relax_abs = relax_abs if (doc_has_timeoff or not only_with_timeoff) else False
-
             # === 絶対禁忌（ABS）===
             # v6.3.0: relax_abs=Trueでも緩和しない制約（物理的に不可能）
 
@@ -1476,28 +1424,27 @@ def choose_doctor_for_slot(
                     continue
 
             # === v6.3.0: 以下のABS制約はrelax_abs=Trueで緩和可能 ===
-            # v6.6.0: eff_relax_* は医師ごとの実効緩和フラグ（休み希望優先緩和）
 
             # ABS-007: gap >= 3日必須
-            if not eff_relax_abs and assigned_dates[doc]:
+            if not relax_abs and assigned_dates[doc]:
                 min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[doc])
                 if min_gap < 3:
                     continue
 
             # ABS-008: 同一病院重複禁止（初期生成時は全列で禁止、fix関数では外病院のみ）
-            if not eff_relax_abs and assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
+            if not relax_abs and assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
                 continue
 
             # ABS-010: TARGET_CAP遵守（n超過禁止）
-            if not eff_relax_abs and assigned_count[doc] >= TARGET_CAP.get(doc, 0):
+            if not relax_abs and assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
 
             # ABS-011: 大学系2回まで（B-K列合計）
-            if not eff_relax_abs and is_BG and assigned_bg[doc] >= 2:
+            if not relax_abs and is_BG and assigned_bg[doc] >= 2:
                 continue
 
             # ABS-012改: 大学系は7日間隔必須（v6.5.0）
-            if not eff_relax_abs and is_BG:
+            if not relax_abs and is_BG:
                 if assigned_bg_dates[doc]:
                     min_bg_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_bg_dates[doc])
                     if min_bg_gap < 7:
@@ -1514,7 +1461,7 @@ def choose_doctor_for_slot(
             is_attr_2 = (doc_attr == "2")  # 属性2は緩和不可
 
             # HARD-001: B/I列1回まで（グループA）
-            if not eff_relax_hard and is_B_or_I and assigned_bi[doc] >= 1:
+            if not relax_hard and is_B_or_I and assigned_bi[doc] >= 1:
                 # カテなし医師は必須遵守
                 if not is_kate_holder:
                     continue
@@ -1523,7 +1470,7 @@ def choose_doctor_for_slot(
                     continue
 
             # HARD-002: C-H/J-K列1回まで（グループB）
-            if not eff_relax_hard and is_CH_or_JK and assigned_chjk[doc] >= 1:
+            if not relax_hard and is_CH_or_JK and assigned_chjk[doc] >= 1:
                 # カテなし医師は必須遵守
                 if not is_kate_holder:
                     continue
@@ -1543,14 +1490,14 @@ def choose_doctor_for_slot(
                     continue
                 elif is_attr_1:
                     # 属性1は緩和可（週1回まで許容）
-                    if not eff_relax_semi:
+                    if not relax_semi:
                         week_start = get_monday_week_start(date)
                         if week_start in semi001_violation_weeks[doc]:
                             continue
                         # 1回目は許容（選ばれた場合、後で週を記録）
                 else:
                     # 属性未設定の場合はsheet3「1」をフォールバック
-                    if not eff_relax_semi and not is_sheet3_one:
+                    if not relax_semi and not is_sheet3_one:
                         week_start = get_monday_week_start(date)
                         if week_start in semi001_violation_weeks[doc]:
                             continue
@@ -1560,27 +1507,16 @@ def choose_doctor_for_slot(
             candidates.append(doc)
         return candidates
 
-    # v6.6.0: 段階的制約緩和（休み希望ありの医師を優先的に緩和）
-    # 各緩和段階で、まず休み希望ありの医師のみ緩和を試み、
-    # それでも候補がなければ全員に緩和を適用する。
+    # v6.3.0: 段階的制約緩和（未割当回避を最優先）
     # 1. 全制約適用
     candidates = collect_candidates()
-    # 2a. SEMI緩和（休み希望ありの医師のみ）
-    if not candidates:
-        candidates = collect_candidates(relax_semi=True, only_with_timeoff=True)
-    # 2b. SEMI緩和（全員）
+    # 2. SEMI緩和
     if not candidates:
         candidates = collect_candidates(relax_semi=True)
-    # 3a. HARD緩和（休み希望ありの医師のみ、SEMI緩和済み）
-    if not candidates:
-        candidates = collect_candidates(relax_semi=True, relax_hard=True, only_with_timeoff=True)
-    # 3b. HARD緩和（全員、SEMI緩和済み）
+    # 3. HARD緩和（SEMI緩和済み）
     if not candidates:
         candidates = collect_candidates(relax_semi=True, relax_hard=True)
-    # 4a. ABS緩和（休み希望ありの医師のみ、SEMI/HARD緩和済み）- 未割当を絶対に回避
-    if not candidates:
-        candidates = collect_candidates(relax_semi=True, relax_hard=True, relax_abs=True, only_with_timeoff=True)
-    # 4b. ABS緩和（全員、SEMI/HARD緩和済み）- 未割当を絶対に回避
+    # 4. ABS緩和（SEMI/HARD緩和済み）- 未割当を絶対に回避
     if not candidates:
         candidates = collect_candidates(relax_semi=True, relax_hard=True, relax_abs=True)
 
@@ -6166,7 +6102,9 @@ else:
 # =========================
 base_name = uploaded_filename.rsplit(".", 1)[0]
 output_filename = f"{base_name}_v{VERSION}.xlsx"
-output_path = output_filename
+_downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+os.makedirs(_downloads_dir, exist_ok=True)
+output_path = os.path.join(_downloads_dir, output_filename)
 
 def _fmt_date_jp(d):
     """日付を 'YYYY/M/D (曜日)' 形式に変換"""
@@ -6451,464 +6389,6 @@ def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnos
     _format_summary_sheet(ws, sections)
 
 
-# =========================================================================
-# v6.7.0: サマリーシート v2 レイアウト
-#   - 2カラムレイアウト: 左にスコアサマリー、右に今月サマリー
-#   - 制約違反セクションの圧縮（空セクション→1行表示）
-#   - 累計詳細テーブルにグループヘッダー追加
-#   - 条件付き色分け・列幅最適化・フリーズペイン
-# =========================================================================
-
-def _classify_detail_columns(detail_cols):
-    """DETAIL_COLSを 支援 / 夜間急病 / 外病院 にグループ分類"""
-    support_cols = []   # 支援系
-    night_cols = []     # 夜間急病
-    external_cols = []  # 外病院
-    attr_cols = []      # 属性
-
-    for c in detail_cols:
-        cs = str(c)
-        if "属性" in cs:
-            attr_cols.append(c)
-        elif "支援" in cs:
-            support_cols.append(c)
-        elif "夜間急病" in cs or "夜間" in cs:
-            night_cols.append(c)
-        else:
-            external_cols.append(c)
-    return attr_cols, support_cols, night_cols, external_cols
-
-
-def write_combined_summary_sheet_v2(writer, sheet_name, df_month, df_total, diagnostics, df_doctors=None):
-    """v6.7.0: 2カラムレイアウトのサマリーシート
-
-    レイアウト:
-      A-C列: スコアサマリー (行1-22)
-      E-J列: 今月サマリー (行1-34)
-      A列〜: 制約違反セクション (行24〜) ← 圧縮表示
-      A列〜: 累計詳細 (その下) ← グループヘッダー付き
-    """
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-    from openpyxl.formatting.rule import CellIsRule
-
-    ws = writer.book.create_sheet(sheet_name)
-    writer.sheets[sheet_name] = ws
-
-    # --- カラー定義 ---
-    NAVY = "1F3864"
-    LIGHT_BLUE_GREY = "D6E4F0"
-    ZEBRA_GREY = "F2F2F2"
-    WHITE_HEX = "FFFFFF"
-    BORDER_GREY = "D9D9D9"
-    VIOLATION_RED = "FFC7CE"
-    SCORE_GREEN = "C6EFCE"
-    SCORE_YELLOW = "FFEB9C"
-    SCORE_RED = "FFC7CE"
-    GROUP_UNIV = "D6E4F0"     # 大学系: 薄青
-    GROUP_SUPPORT = "D5E8D4"  # 支援: 薄緑
-    GROUP_NIGHT = "E2EFDA"    # 夜間急病: 薄緑系
-    GROUP_EXTERNAL = "FCE4D6" # 外病院: 薄オレンジ
-    GREY_TEXT = "808080"
-    ZERO_GREY = "C0C0C0"
-
-    # --- スタイル定義 ---
-    font_base = Font(name="MS Pゴシック", size=10)
-    font_title = Font(name="MS Pゴシック", size=12, bold=True, color=WHITE_HEX)
-    font_header = Font(name="MS Pゴシック", size=11, bold=True)
-    font_desc = Font(name="MS Pゴシック", size=9, color=GREY_TEXT)
-    font_detail_header = Font(name="MS Pゴシック", size=10, bold=True)
-    font_zero = Font(name="MS Pゴシック", size=10, color=ZERO_GREY)
-    fill_title = PatternFill(start_color=NAVY, end_color=NAVY, fill_type="solid")
-    fill_header = PatternFill(start_color=LIGHT_BLUE_GREY, end_color=LIGHT_BLUE_GREY, fill_type="solid")
-    fill_zebra = PatternFill(start_color=ZEBRA_GREY, end_color=ZEBRA_GREY, fill_type="solid")
-    fill_white = PatternFill(start_color=WHITE_HEX, end_color=WHITE_HEX, fill_type="solid")
-    fill_violation = PatternFill(start_color=VIOLATION_RED, end_color=VIOLATION_RED, fill_type="solid")
-    fill_green = PatternFill(start_color=SCORE_GREEN, end_color=SCORE_GREEN, fill_type="solid")
-    fill_yellow = PatternFill(start_color=SCORE_YELLOW, end_color=SCORE_YELLOW, fill_type="solid")
-    fill_red = PatternFill(start_color=SCORE_RED, end_color=SCORE_RED, fill_type="solid")
-    fill_grp_univ = PatternFill(start_color=GROUP_UNIV, end_color=GROUP_UNIV, fill_type="solid")
-    fill_grp_support = PatternFill(start_color=GROUP_SUPPORT, end_color=GROUP_SUPPORT, fill_type="solid")
-    fill_grp_night = PatternFill(start_color=GROUP_NIGHT, end_color=GROUP_NIGHT, fill_type="solid")
-    fill_grp_external = PatternFill(start_color=GROUP_EXTERNAL, end_color=GROUP_EXTERNAL, fill_type="solid")
-    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    thin_border = Border(
-        left=Side(style="thin", color=BORDER_GREY),
-        right=Side(style="thin", color=BORDER_GREY),
-        top=Side(style="thin", color=BORDER_GREY),
-        bottom=Side(style="thin", color=BORDER_GREY),
-    )
-    header_bottom_border = Border(
-        left=Side(style="thin", color=BORDER_GREY),
-        right=Side(style="thin", color=BORDER_GREY),
-        top=Side(style="thin", color=BORDER_GREY),
-        bottom=Side(style="medium", color="000000"),
-    )
-    detail_underline_border = Border(
-        bottom=Side(style="thin", color="999999"),
-    )
-
-    def _write_cell(r, c, val, font=None, fill=None, alignment=None, border=None):
-        """セルに値と書式を設定するヘルパー"""
-        cell = ws.cell(row=r, column=c, value=val)
-        if font:
-            cell.font = font
-        if fill:
-            cell.fill = fill
-        if alignment:
-            cell.alignment = alignment
-        if border:
-            cell.border = border
-        return cell
-
-    # ==================================================================
-    # ステップ1: スコアサマリーを左上（A1:C列）に配置
-    # ==================================================================
-
-    # diagnosticsからスコアサマリーを抽出
-    df_metrics = None
-    for title, df in diagnostics:
-        if "スコア" in title:
-            df_metrics = df
-            break
-
-    # A1: セクションヘッダー
-    _write_cell(1, 1, "【スコアサマリー】", font_title, fill_title, align_center)
-    _write_cell(1, 2, None, font_title, fill_title, align_center)
-    _write_cell(1, 3, None, font_title, fill_title, align_center)
-    ws.merge_cells("A1:C1")
-
-    # A2:C2: ヘッダー行
-    for ci, hdr in enumerate(["項目", "値", "説明"], 1):
-        _write_cell(2, ci, hdr, font_header, fill_header, align_center, header_bottom_border)
-
-    # A3〜: スコアデータ
-    score_end_row = 2
-    if df_metrics is not None and len(df_metrics) > 0:
-        for i, (_, mrow) in enumerate(df_metrics.iterrows()):
-            r = 3 + i
-            item_val = mrow.get("項目", "")
-            num_val = mrow.get("値", "")
-            desc_val = mrow.get("説明", "")
-
-            is_separator = "---" in str(item_val)
-
-            _write_cell(r, 1, item_val, font_base, None, align_left, thin_border)
-            cell_b = _write_cell(r, 2, num_val, font_base, None, align_center, thin_border)
-            _write_cell(r, 3, desc_val, font_desc, None, align_left, thin_border)
-
-            # ゼブラストライプ
-            row_fill = fill_zebra if (i % 2 == 1) else fill_white
-            if is_separator:
-                row_fill = fill_header
-            for ci in range(1, 4):
-                if not is_separator:
-                    ws.cell(row=r, column=ci).fill = row_fill
-
-            # 値の条件付き色分け
-            if not is_separator and num_val != "" and num_val is not None:
-                try:
-                    nv = float(num_val)
-                    if "総合スコア" in str(item_val):
-                        if nv >= 80:
-                            cell_b.fill = fill_green
-                        elif nv >= 50:
-                            cell_b.fill = fill_yellow
-                        else:
-                            cell_b.fill = fill_red
-                    elif "ペナルティ合計" in str(item_val):
-                        if nv >= 100:
-                            cell_b.fill = fill_red
-                        elif nv > 0:
-                            cell_b.fill = fill_yellow
-                        else:
-                            cell_b.fill = fill_green
-                    else:
-                        if nv == 0:
-                            cell_b.fill = fill_green
-                        elif nv >= 1:
-                            cell_b.fill = fill_yellow
-                except (ValueError, TypeError):
-                    pass
-
-            score_end_row = r
-
-    # ==================================================================
-    # ステップ2: 今月サマリーを右側（E1:J列）に配置
-    # ==================================================================
-    COMPACT_COLS = ["氏名", "全合計", "大学合計", "外病院合計", "平日", "休日合計"]
-    E_COL_START = 5  # E列
-
-    df_month_compact = df_month[COMPACT_COLS].copy()
-    sheet2_order = {doc: i for i, doc in enumerate(doctor_names)}
-    df_month_compact["_sort"] = df_month_compact["氏名"].map(sheet2_order)
-    df_month_compact = df_month_compact.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
-
-    # E1: セクションヘッダー
-    for ci in range(E_COL_START, E_COL_START + len(COMPACT_COLS)):
-        _write_cell(1, ci, None, font_title, fill_title, align_center)
-    _write_cell(1, E_COL_START, "【今月サマリー】", font_title, fill_title, align_center)
-    ws.merge_cells(start_row=1, start_column=E_COL_START, end_row=1, end_column=E_COL_START + len(COMPACT_COLS) - 1)
-
-    # E2:J2: ヘッダー行
-    for ci, hdr in enumerate(COMPACT_COLS):
-        _write_cell(2, E_COL_START + ci, hdr, font_header, fill_header, align_center, header_bottom_border)
-
-    # E3〜: 医師データ
-    month_end_row = 2
-    for i, (_, drow) in enumerate(df_month_compact.iterrows()):
-        r = 3 + i
-        row_fill = fill_zebra if (i % 2 == 1) else fill_white
-        for ci, col in enumerate(COMPACT_COLS):
-            val = drow[col]
-            al = align_left if ci == 0 else align_center
-            fnt = font_base
-            _write_cell(r, E_COL_START + ci, val, fnt, row_fill, al, thin_border)
-        month_end_row = r
-
-    # D列は空列（区切り）
-    ws.column_dimensions["D"].width = 3
-
-    # ==================================================================
-    # ステップ3: 制約違反セクションの圧縮（スコアサマリーの下）
-    # ==================================================================
-
-    # 制約違反データを抽出
-    violation_map = {}  # title -> df
-    violation_order = [
-        ("gap（3日未満）", "【制約違反: gap（3日未満）】"),
-        ("同日重複", "【制約違反: 同日重複】"),
-        ("同一病院重複", "【制約違反: 同一病院重複】"),
-        ("大学系週1違反", "【制約違反: 大学系週1違反】"),
-        ("未割当枠", "【制約違反: 未割当枠】"),
-        ("重要/推奨ルール違反", "【制約違反: 重要/推奨ルール】"),
-    ]
-    for title, df in diagnostics:
-        for label, orig_title in violation_order:
-            if orig_title == title:
-                violation_map[label] = df
-                break
-
-    # 開始行: スコアサマリーと今月サマリーの両方の下 + 2行空け
-    viol_start = max(score_end_row, month_end_row) + 2
-
-    # セクションヘッダー
-    _write_cell(viol_start, 1, "【制約違反サマリー】", font_title, fill_title, align_center)
-    for ci in range(2, 10):
-        _write_cell(viol_start, ci, None, font_title, fill_title, align_center)
-    ws.merge_cells(start_row=viol_start, start_column=1, end_row=viol_start, end_column=9)
-
-    # ヘッダー行
-    viol_hdr_row = viol_start + 1
-    for ci, hdr in enumerate(["制約種別", "件数", "ステータス"], 1):
-        _write_cell(viol_hdr_row, ci, hdr, font_header, fill_header, align_center, header_bottom_border)
-
-    # サマリー行
-    cur_row = viol_hdr_row + 1
-    violations_with_details = []  # (label, df) 件数>0のみ
-    for i, (label, _) in enumerate(violation_order):
-        df_v = violation_map.get(label)
-        count = len(df_v) if df_v is not None else 0
-        if count == 0:
-            status = "✓ 違反なし"
-            status_fill = fill_green
-        else:
-            status = "⚠ 要確認"
-            status_fill = fill_yellow
-            violations_with_details.append((label, df_v))
-
-        row_fill = fill_zebra if (i % 2 == 1) else fill_white
-        _write_cell(cur_row, 1, label, font_base, row_fill, align_left, thin_border)
-        _write_cell(cur_row, 2, count, font_base, status_fill, align_center, thin_border)
-        _write_cell(cur_row, 3, status, font_base, status_fill, align_center, thin_border)
-        cur_row += 1
-
-    # 件数 > 0 のセクションの詳細を展開
-    for label, df_v in violations_with_details:
-        cur_row += 1  # 空行
-        _write_cell(cur_row, 1, f"▼ {label} 詳細", font_detail_header, None, align_left, detail_underline_border)
-        for ci in range(2, len(df_v.columns) + 1):
-            _write_cell(cur_row, ci, None, None, None, None, detail_underline_border)
-        cur_row += 1
-
-        # 詳細テーブルヘッダー
-        df_v_fmt = _fmt_date_cols(df_v)
-        for ci, col in enumerate(df_v_fmt.columns, 1):
-            _write_cell(cur_row, ci, col, font_header, fill_header, align_center, header_bottom_border)
-        cur_row += 1
-
-        # 詳細データ行
-        for j, (_, vrow) in enumerate(df_v_fmt.iterrows()):
-            for ci, col in enumerate(df_v_fmt.columns, 1):
-                val = vrow[col]
-                al = align_left if ci == 1 else align_center
-                _write_cell(cur_row, ci, val, font_base, fill_violation, al, thin_border)
-            cur_row += 1
-
-    # ==================================================================
-    # ステップ4: 累計詳細テーブル（制約違反セクションの下）
-    # ==================================================================
-    detail_cols_available = [c for c in SUMMARY_DETAIL_COLS if c in df_total.columns]
-    if detail_cols_available:
-        cur_row += 2  # 空行
-
-        # 列グループ分類
-        attr_cols, support_cols, night_cols, external_cols = _classify_detail_columns(DETAIL_COLS)
-        # DETAIL_COLSの中で実際にdf_totalに存在するもののみ
-        attr_cols = [c for c in attr_cols if c in df_total.columns]
-        support_cols = [c for c in support_cols if c in df_total.columns]
-        night_cols = [c for c in night_cols if c in df_total.columns]
-        external_cols = [c for c in external_cols if c in df_total.columns]
-        univ_cols = [c for c in UNIV7_ORDER if c in df_total.columns]
-
-        # 列順序: 氏名 | 大学系 | 属性 | 支援 | 夜間急病 | 外病院
-        ordered_cols = univ_cols + attr_cols + support_cols + night_cols + external_cols
-        all_detail_with_name = ["氏名"] + ordered_cols
-
-        # セクションヘッダー
-        total_cols = len(all_detail_with_name)
-        _write_cell(cur_row, 1, "【累計詳細】", font_title, fill_title, align_center)
-        for ci in range(2, total_cols + 1):
-            _write_cell(cur_row, ci, None, font_title, fill_title, align_center)
-        ws.merge_cells(start_row=cur_row, start_column=1, end_row=cur_row, end_column=total_cols)
-        cur_row += 1
-
-        # グループヘッダー行（2段ヘッダーの1段目）
-        group_header_row = cur_row
-        _write_cell(cur_row, 1, "", font_header, fill_header, align_center, thin_border)
-        ci = 2  # B列から開始（A列は氏名）
-
-        # 大学系グループ
-        if univ_cols:
-            grp_start = ci
-            for _ in univ_cols:
-                _write_cell(cur_row, ci, None, font_header, fill_grp_univ, align_center, thin_border)
-                ci += 1
-            _write_cell(cur_row, grp_start, "大学系", font_header, fill_grp_univ, align_center, thin_border)
-            if len(univ_cols) > 1:
-                ws.merge_cells(start_row=cur_row, start_column=grp_start, end_row=cur_row, end_column=grp_start + len(univ_cols) - 1)
-
-        # 属性グループ
-        if attr_cols:
-            grp_start = ci
-            for _ in attr_cols:
-                _write_cell(cur_row, ci, None, font_header, fill_header, align_center, thin_border)
-                ci += 1
-            _write_cell(cur_row, grp_start, "属性", font_header, fill_header, align_center, thin_border)
-            if len(attr_cols) > 1:
-                ws.merge_cells(start_row=cur_row, start_column=grp_start, end_row=cur_row, end_column=grp_start + len(attr_cols) - 1)
-
-        # 支援グループ
-        if support_cols:
-            grp_start = ci
-            for _ in support_cols:
-                _write_cell(cur_row, ci, None, font_header, fill_grp_support, align_center, thin_border)
-                ci += 1
-            _write_cell(cur_row, grp_start, "支援", font_header, fill_grp_support, align_center, thin_border)
-            if len(support_cols) > 1:
-                ws.merge_cells(start_row=cur_row, start_column=grp_start, end_row=cur_row, end_column=grp_start + len(support_cols) - 1)
-
-        # 夜間急病グループ
-        if night_cols:
-            grp_start = ci
-            for _ in night_cols:
-                _write_cell(cur_row, ci, None, font_header, fill_grp_night, align_center, thin_border)
-                ci += 1
-            _write_cell(cur_row, grp_start, "夜間急病", font_header, fill_grp_night, align_center, thin_border)
-            if len(night_cols) > 1:
-                ws.merge_cells(start_row=cur_row, start_column=grp_start, end_row=cur_row, end_column=grp_start + len(night_cols) - 1)
-
-        # 外病院グループ
-        if external_cols:
-            grp_start = ci
-            for _ in external_cols:
-                _write_cell(cur_row, ci, None, font_header, fill_grp_external, align_center, thin_border)
-                ci += 1
-            _write_cell(cur_row, grp_start, "外病院", font_header, fill_grp_external, align_center, thin_border)
-            if len(external_cols) > 1:
-                ws.merge_cells(start_row=cur_row, start_column=grp_start, end_row=cur_row, end_column=grp_start + len(external_cols) - 1)
-
-        cur_row += 1
-
-        # 個別ヘッダー行（2段ヘッダーの2段目）
-        for ci, col in enumerate(all_detail_with_name, 1):
-            _write_cell(cur_row, ci, col, font_header, fill_header, align_center, header_bottom_border)
-        cur_row += 1
-
-        # 累計データを氏名順で書き出し
-        df_detail = df_total[all_detail_with_name].copy()
-        df_detail["_sort"] = df_detail["氏名"].map(sheet2_order)
-        df_detail = df_detail.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
-
-        # 各列の上位3値を計算（太字表示用）
-        top3_thresholds = {}
-        for col in ordered_cols:
-            try:
-                vals = pd.to_numeric(df_detail[col], errors="coerce").dropna()
-                if len(vals) > 0:
-                    sorted_vals = vals.sort_values(ascending=False).unique()
-                    if len(sorted_vals) >= 3:
-                        top3_thresholds[col] = sorted_vals[2]  # 3番目に大きい値
-                    elif len(sorted_vals) >= 1 and sorted_vals[0] > 0:
-                        top3_thresholds[col] = sorted_vals[0]
-            except Exception:
-                pass
-
-        for i, (_, drow) in enumerate(df_detail.iterrows()):
-            row_fill = fill_zebra if (i % 2 == 1) else fill_white
-            for ci, col in enumerate(all_detail_with_name, 1):
-                val = drow[col]
-                al = align_left if ci == 1 else align_center
-                fnt = font_base
-
-                # 値が0のセルはグレー文字
-                is_zero = False
-                try:
-                    if ci > 1 and float(val) == 0:
-                        is_zero = True
-                        fnt = font_zero
-                except (ValueError, TypeError):
-                    pass
-
-                # 上位3値は太字
-                if not is_zero and col in top3_thresholds:
-                    try:
-                        nv = float(val)
-                        if nv >= top3_thresholds[col] and nv > 0:
-                            fnt = Font(name="MS Pゴシック", size=10, bold=True)
-                    except (ValueError, TypeError):
-                        pass
-
-                _write_cell(cur_row, ci, val, fnt, row_fill, al, thin_border)
-            cur_row += 1
-
-    # ==================================================================
-    # ステップ5: 全体の書式・構造設定
-    # ==================================================================
-
-    # 列幅の最適化
-    ws.column_dimensions["A"].width = 22    # 氏名 / 項目
-    ws.column_dimensions["B"].width = 14    # 値 / 数値
-    ws.column_dimensions["C"].width = 38    # 説明
-    ws.column_dimensions["D"].width = 3     # 区切り
-    ws.column_dimensions["E"].width = 14    # 氏名（今月サマリー）
-    for cl_letter in ["F", "G", "H", "I", "J"]:
-        ws.column_dimensions[cl_letter].width = 12  # 数値列
-
-    # 累計詳細の列幅（K列以降）
-    if detail_cols_available:
-        for ci in range(len(all_detail_with_name)):
-            col_letter = get_column_letter(ci + 1)
-            if ci == 0:
-                continue  # A列は設定済み
-            if ci + 1 > 10:  # K列以降
-                ws.column_dimensions[col_letter].width = 10
-
-    # フリーズペイン: A3固定（ヘッダー2行分）
-    ws.freeze_panes = "A3"
-
-
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     # v6.3.0: sheet1-4は出力しない（元データ不要）
 
@@ -6932,18 +6412,17 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df_month, df_total = build_summaries(entry["pattern_df"], counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat)
         df_doctors, df_gap, df_same, df_hdup, df_weekly_bg, df_unass, df_metrics, df_hard_violations = build_diagnostics(entry["pattern_df"])
 
-        # v6.7.0: v2レイアウト（2カラム・圧縮違反・グループヘッダー）
-        write_combined_summary_sheet_v2(
+        write_combined_summary_sheet(
             writer,
             sheet_name=f"{sheet_label}_summary",
             df_month=df_month,
             df_total=df_total,
             diagnostics=[
-                ("【医師ごとの偏り】", df_doctors),
+                ("【医師ごとの偏り】", df_doctors),  # v6.5.3: 上部テーブルに統合されるためスキップ
                 ("【制約違反: gap（3日未満）】", df_gap),
                 ("【制約違反: 同日重複】", df_same),
                 ("【制約違反: 同一病院重複】", df_hdup),
-                ("【制約違反: 大学系週1違反】", df_weekly_bg),
+                ("【制約違反: 大学系週1違反】", df_weekly_bg),  # v6.4.0: ABS-012
                 ("【制約違反: 未割当枠】", df_unass),
                 ("【制約違反: 重要/推奨ルール】", df_hard_violations),
                 ("【スコアサマリー】", df_metrics),
@@ -6957,14 +6436,11 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             _auto_format_sheet(ws)
 
 print("\n" + "="*60)
-print("  🎉 完了")
+print("  完了")
 print("="*60)
-print(f"\n📥 出力: {output_path}")
+print(f"\n出力ファイル: {output_path}")
 print("\n【内容】")
 for rank in range(1, len(top_patterns) + 1):
     label = f"pattern_{rank:02d}"
     print(f"  {label}: スケジュール / {label}_summary: サマリー・診断")
 print("="*60)
-
-if COLAB_AVAILABLE:
-    files.download(output_path)

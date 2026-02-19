@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 *.so
 .Python
+env/
+venv/
+ENV/
 build/
 develop-eggs/
 dist/
@@ -20,12 +23,6 @@ wheels/
 .installed.cfg
 *.egg
 
-# 仮想環境
-.venv/
-venv/
-env/
-ENV/
-
 # IDE
 .vscode/
 .idea/
@@ -37,14 +34,11 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# data/ 配下のCSV・Excelファイル（個人情報保護のため）
-data/*.xlsx
-data/*.xls
-data/*.csv
-data/output/
-!data/.gitkeep
-!data/output/.gitkeep
-!data/sample_staff.csv
+# Project specific
+*.xlsx
+*.xls
+!sample_data/*.xlsx
+!sample_data/*.xls
 
 # Logs
 *.log

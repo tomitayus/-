@@ -62,6 +62,7 @@ OPTIMIZATION_ENABLED = True
 # ABS/HARD制約はfix関数で強制されるため重み不要。
 
 W_FAIR_TOTAL = 30       # SOFT-001: 公平性（max-min最小化）
+W_FAIR_CUM = 10         # SOFT-009: 累計（前月+今月）公平性（v6.5.9、月またぎの偏り最小化）
 W_CODE_12_UNIV = 150    # SOFT-002: コード1.2の医師は大学系最低1回
 W_BG_HT_DIFF = 100      # SOFT-003: 大学/外病院の差が3以上でペナルティ
 W_UNASSIGNED = 500       # 未割当枠のペナルティ

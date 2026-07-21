@@ -338,7 +338,7 @@ from collections import defaultdict
 import random
 
 # バージョン定数
-VERSION = "6.5.6"
+VERSION = "6.5.9"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -380,6 +380,7 @@ LOCAL_REFRESH_EVERY = 200     # 問題医師（gap/重複）を再抽出する�
 # v6.0.0 スコア重み（ソフト制約のみ）
 # 絶対禁忌(ABS)とハード制約(HARD)は候補選定時にチェック済み
 W_FAIR_TOTAL = getattr(_cfg, 'W_FAIR_TOTAL', 30)
+W_FAIR_CUM = getattr(_cfg, 'W_FAIR_CUM', 10)  # v6.5.9: 累計（前月+今月）公平性
 W_CODE_12_UNIV = getattr(_cfg, 'W_CODE_12_UNIV', 150)
 W_BG_HT_DIFF = getattr(_cfg, 'W_BG_HT_DIFF', 100)
 # 以下は絶対禁忌のためペナルティ不要（v6.0.0）
@@ -704,24 +705,32 @@ print(f"\n✅ Excel読込完了: 医師{len(doctor_names)}人 | 病院{len(hospi
 # =========================
 # sheet2 可否コード
 # =========================
-fallback_avail_codes = {}
-for doc in doctor_names:
-    col_vals = availability_raw[doc]
-    first_val = None
-    for v in col_vals:
-        if pd.notna(v):
-            first_val = v
-            break
-    if first_val is None:
-        fallback_avail_codes[doc] = 1
-    else:
-        try:
-            c = int(first_val)
-        except Exception:
-            c = 1
-        if c not in (0, 1, 2, 3):
-            c = 1
-        fallback_avail_codes[doc] = c
+# v6.5.9: 空欄は常に「1（可）」として扱う。
+# 旧実装は列の最初のマークを全空欄日のフォールバックにしていたため、
+# 月初の 0/2/3 マークが全月へ伝播し、休み希望・列制限が意図せず拡大していた
+# （例: 1日だけ0を書いた医師が全月不可=inactive扱いになる）。
+# 解釈できないマーク（非数値・未定義コード）は読込時に警告する。
+_invalid_avail_marks = []
+if isinstance(availability_df.index, pd.DatetimeIndex):
+    for doc in doctor_names:
+        if doc not in availability_df.columns:
+            continue
+        for _dt, _v in availability_df[doc].items():
+            if pd.isna(_v):
+                continue
+            try:
+                _f = float(_v)
+                _ok = abs(_f - 1.2) < 0.01 or _f in (0.0, 1.0, 2.0, 3.0)
+            except Exception:
+                _ok = False
+            if not _ok:
+                _invalid_avail_marks.append((_dt, doc, _v))
+if _invalid_avail_marks:
+    print(f"⚠️ WARNING: sheet2に解釈できないマークが{len(_invalid_avail_marks)}件あります → 全て「可(1)」として扱われます:")
+    for _dt, _doc, _v in _invalid_avail_marks[:10]:
+        print(f"   - {pd.to_datetime(_dt).strftime('%Y-%m-%d')} {_doc}: {_v!r}")
+    if len(_invalid_avail_marks) > 10:
+        print(f"   ... 他{len(_invalid_avail_marks) - 10}件")
 
 def get_avail_code(date, doctor):
     """可否コードを取得
@@ -758,7 +767,7 @@ def get_avail_code(date, doctor):
         except Exception:
             pass
     if code is None:
-        code = fallback_avail_codes.get(doctor, 1)
+        code = 1  # v6.5.9: 空欄・解釈不能は「可」（旧: 月初マークへのフォールバックは伝播バグのため廃止）
     if code not in (0, 1, 1.2, 2, 3):
         code = 1
     return code
@@ -1063,25 +1072,35 @@ BASE_TARGET = total_slots // len(active_doctors)
 EXTRA_SLOTS = total_slots - BASE_TARGET * len(active_doctors)
 
 # 余り枠(EXTRA)は属性1の医師から優先的に選出する
-# v6.5.8: 属性1の医師を優先、不足時はSheet2末尾からフォールバック
+# v6.5.9: 同一優先度内では前月累積（全合計）が最少の医師から選出
+#   - 旧実装のSheet2末尾順は位置ベースで、累積最多の医師に+1が付き
+#     月をまたいだ公平性が逆行するケースがあった
 # v6.0.5: CODE_2医師もEXTRA対象に含める
 #   - CODE_2除外だと、他医師の制約(gap/dup等)で枠が埋まらず未割当が発生する
 #   - CODE_2医師のn+1回目はB〜Q列（大学系）に割り当てればよい
 active_sorted_by_index = sorted(active_doctors, key=lambda d: doctor_col_index[d])
 
-# 属性1の医師をEXTRA候補として優先選出（Sheet2末尾順）
+def _extra_priority(d):
+    """EXTRA枠の選出順: 前月累積（全合計）が少ない順 → Sheet2列順"""
+    return (prev_total.get(d, 0), doctor_col_index[d])
+
+# 属性1の医師をEXTRA候補として優先選出（前月累積最少順）
 attr1_doctors = [d for d in active_sorted_by_index if doctor_attribute.get(d, "") == "1"]
-if EXTRA_SLOTS > 0 and len(attr1_doctors) >= EXTRA_SLOTS:
-    # 属性1の医師で十分 → 末尾からEXTRA_SLOTS人を選出
-    EXTRA_ALLOWED = set(attr1_doctors[-EXTRA_SLOTS:])
-elif EXTRA_SLOTS > 0 and attr1_doctors:
-    # 属性1だけでは不足 → 属性1全員 + 残りをSheet2末尾の非属性1から補充
-    remaining = EXTRA_SLOTS - len(attr1_doctors)
-    non_attr1 = [d for d in active_sorted_by_index if d not in attr1_doctors]
-    EXTRA_ALLOWED = set(attr1_doctors) | set(non_attr1[-remaining:])
+attr1_by_prev = sorted(attr1_doctors, key=_extra_priority)
+non_attr1_by_prev = sorted(
+    [d for d in active_sorted_by_index if d not in attr1_doctors], key=_extra_priority
+)
+if EXTRA_SLOTS > 0 and len(attr1_by_prev) >= EXTRA_SLOTS:
+    # 属性1の医師で十分 → 前月累積が少ない順にEXTRA_SLOTS人を選出
+    EXTRA_ALLOWED = set(attr1_by_prev[:EXTRA_SLOTS])
+elif EXTRA_SLOTS > 0 and attr1_by_prev:
+    # 属性1だけでは不足 → 属性1全員 + 残りを前月累積最少の非属性1から補充
+    remaining = EXTRA_SLOTS - len(attr1_by_prev)
+    EXTRA_ALLOWED = set(attr1_by_prev) | set(non_attr1_by_prev[:remaining])
 else:
-    # 属性1がいない場合はSheet2末尾からフォールバック
-    EXTRA_ALLOWED = set(active_sorted_by_index[-EXTRA_SLOTS:] if EXTRA_SLOTS > 0 else [])
+    # 属性1がいない場合は前月累積最少からフォールバック
+    _all_by_prev = sorted(active_sorted_by_index, key=_extra_priority)
+    EXTRA_ALLOWED = set(_all_by_prev[:EXTRA_SLOTS] if EXTRA_SLOTS > 0 else [])
 
 TARGET_CAP = {d: 0 for d in doctor_names}
 for d in active_doctors:
@@ -1122,13 +1141,9 @@ if gap3_cap_adjusted > 0:
 total_cap = sum(TARGET_CAP[d] for d in active_doctors)
 shortage = total_slots - total_cap
 if shortage > 0:
-    # 属性1の医師に優先的に再配分、次にSheet2末尾順
-    _redist_candidates = (
-        [d for d in active_sorted_by_index if doctor_attribute.get(d, "") == "1"]
-        + [d for d in active_sorted_by_index if doctor_attribute.get(d, "") != "1"]
-    )
-    # 末尾（後方）の医師から配分するため逆順
-    for d in reversed(_redist_candidates):
+    # 属性1の医師に優先的に再配分、同一優先度内は前月累積が少ない順（v6.5.9）
+    _redist_candidates = attr1_by_prev + non_attr1_by_prev
+    for d in _redist_candidates:
         if shortage <= 0:
             break
         max_gap3 = compute_max_gap3_assignments(d)
@@ -2059,6 +2074,15 @@ def evaluate_schedule_with_raw(
     else:
         fairness_penalty = max(0, diff_total - 1)
 
+    # v6.5.9: 累計（前月+今月）全合計の公平性（SOFT-009）
+    # 前月までの累積を含めた通算回数の偏りを最適化対象にする
+    # （従来は前月累積がgreedy候補ソートと表示にしか使われず、重み0だった）
+    cum_totals = [
+        prev_total.get(d, 0) + assigned_count.get(d, 0) - cc_counts.get(d, 0)
+        for d in active_doctors
+    ]
+    cum_total_spread = (max(cum_totals) - min(cum_totals)) if cum_totals else 0
+
     # gap(4日未満) と 同一病院重複
     # v6.2.0: 各割当が固定割当かどうかも記録（gap/dup計算で固定割当を除外するため）
     dates_by_doc = defaultdict(list)  # doc -> [(date, is_preassigned), ...]
@@ -2246,6 +2270,7 @@ def evaluate_schedule_with_raw(
 
     penalty = 0
     penalty += fairness_penalty * W_FAIR_TOTAL
+    penalty += max(0, cum_total_spread - 1) * W_FAIR_CUM  # v6.5.9: 累計公平性
     penalty += gap_violations * W_GAP
     penalty += hosp_dup_violations * W_HOSP_DUP
     penalty += external_hosp_dup_violations * W_EXTERNAL_HOSP_DUP  # 外病院重複は厳格
@@ -2292,6 +2317,7 @@ def evaluate_schedule_with_raw(
         "weekly_bg_violations": int(weekly_bg_violations),  # v6.4.0: 大学系週1違反（ABS-012）
         "wd_we_imbalance_violations": int(wd_we_imbalance_violations),  # 全体の平日/休日偏り（差>=2）
         "we_0_violations": int(we_0_violations),  # 休日0回違反
+        "total_spread_cum": float(cum_total_spread),  # v6.5.9: 累計全合計のmax-min
         "bg_spread_cum": float(bg_spread),
         "ht_spread_cum": float(ht_spread),
         "weekday_spread_cum": float(wd_spread),
@@ -2883,6 +2909,7 @@ def build_metrics_df(score_clamped, raw_score, metrics):
         {"項目": "割当回数の偏り（max-min）", "値": int(metrics.get("max_minus_min_total_active", 0)), "説明": "active医師間の最大-最小割当回数差"},
         {"項目": "公平性ペナルティ", "値": int(metrics.get("fairness_penalty", 0)), "説明": "偏りが2以上で発生するペナルティ"},
         {"項目": "--- 偏り（累計spread） ---", "値": "", "説明": ""},
+        {"項目": "累計全合計spread", "値": float(metrics.get("total_spread_cum", 0)), "説明": "累計全合計回数のmax-min（前月+今月、v6.5.9）"},
         {"項目": "大学系spread", "値": float(metrics.get("bg_spread_cum", 0)), "説明": "累計大学回数のmax-min（前月+今月）"},
         {"項目": "外病院spread", "値": float(metrics.get("ht_spread_cum", 0)), "説明": "累計外病院回数のmax-min"},
         {"項目": "平日spread", "値": float(metrics.get("weekday_spread_cum", 0)), "説明": "累計平日回数のmax-min"},
@@ -5160,6 +5187,9 @@ def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
                 date = pd.to_datetime(date).normalize().tz_localize(None)
 
                 for hosp in hospital_cols:
+                    # v6.5.9: 固定割当（preassigned）は公平化の移動対象から除外
+                    if is_preassigned_slot(ridx, hosp):
+                        continue
                     val = df.at[ridx, hosp]
                     if isinstance(val, str) and normalize_name(val) == max_doc:
                         max_doc_positions.append((ridx, hosp, date))
@@ -5175,43 +5205,51 @@ def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
                     if isinstance(v, str):
                         already_assigned_on_date.add(normalize_name(v))
 
+                # 対象スロットの平日/休日分類（recompute_statsと同一ロジック）
+                hosp_idx = shift_df.columns.get_loc(hosp)
+                slot_dow = date.weekday()
+                slot_is_holiday = (
+                    is_holiday(date)
+                    or slot_dow >= 5
+                    or (slot_dow < 5 and hosp_idx in (C_COL_INDEX, D_COL_INDEX, F_COL_INDEX, G_COL_INDEX))
+                )
+
                 # 最小回数の医師の中から代替を探す
                 for min_doc in min_docs:
-                    if min_doc in already_assigned_on_date:
-                        continue
-                    if not can_assign_doc_to_slot(min_doc, date, hosp):
-                        continue
-
-                    # gap制約チェック（移動後にgap違反が発生しないか）
-                    # min_docに割り当てた場合のgap違反チェック
-                    # doc_assignments は (date, hosp) のタプルのリスト
-                    min_doc_dates = sorted([d for d, h in doc_assignments.get(min_doc, []) if h != hosp or d != date])
-                    new_dates = sorted(min_doc_dates + [date])
-
-                    gap_ok = True
-                    for j in range(len(new_dates) - 1):
-                        gap = (new_dates[j + 1] - new_dates[j]).days
-                        if gap < 3:
-                            gap_ok = False
-                            break
-
-                    if not gap_ok:
+                    # v6.5.9: is_valid_full_assignmentで全ABS制約を統合チェック
+                    # （ABS-001〜006静的制約, ABS-007 gap, ABS-008外病院重複,
+                    #   ABS-010 TARGET_CAP, ABS-011大学系2回）
+                    # 移動がABS違反を新規に作るとsafe_fixが全戻しし公平化自体が
+                    # 無効化されるため、移動時点で完全に検証する
+                    if not is_valid_full_assignment(
+                        min_doc, date, hosp,
+                        doc_assignments, counts, bg_counts, assigned_hosp_count,
+                        already_on_date=already_assigned_on_date,
+                    ):
                         continue
 
-                    # 外病院重複チェック
-                    hosp_idx = shift_df.columns.get_loc(hosp)
-                    is_external = L_COL_INDEX <= hosp_idx <= L_Y_END_INDEX
-                    if is_external:
-                        # min_docがこの外病院に既に割り当てられている場合は拒否
-                        if assigned_hosp_count.get(min_doc, {}).get(hosp, 0) >= 1:
+                    # v6.5.9: ABS-013 C-H列（休日大学系）カテ当番必須
+                    if is_ch_slot(hosp_idx) and not is_eligible_for_ch_slot(min_doc, date):
+                        continue
+
+                    # v6.5.9: ABS-012 大学系7日間隔（B-K列に移す場合）
+                    if B_COL_INDEX <= hosp_idx <= B_K_END_INDEX:
+                        bg_dates = [
+                            d for d, h in doc_assignments.get(min_doc, [])
+                            if B_COL_INDEX <= shift_df.columns.get_loc(h) <= B_K_END_INDEX
+                        ]
+                        if any(abs((date - d).days) < 7 for d in bg_dates):
                             continue
 
-                    # max_docから削除した場合のgap違反チェック
-                    max_doc_dates = sorted([d for d, h in doc_assignments.get(max_doc, []) if h != hosp or d != date])
-                    if len(max_doc_dates) >= 2:
-                        for j in range(len(max_doc_dates) - 1):
-                            gap = (max_doc_dates[j + 1] - max_doc_dates[j]).days
-                            # 削除によってgap違反が発生することはない（削除は間隔を広げるだけ）
+                    # v6.5.9: ABS-014 平日/休日偏り（移動元・移動先とも差<=1を維持）
+                    if slot_is_holiday:
+                        min_wd, min_we = wd_counts.get(min_doc, 0), we_counts.get(min_doc, 0) + 1
+                        max_wd, max_we = wd_counts.get(max_doc, 0), we_counts.get(max_doc, 0) - 1
+                    else:
+                        min_wd, min_we = wd_counts.get(min_doc, 0) + 1, we_counts.get(min_doc, 0)
+                        max_wd, max_we = wd_counts.get(max_doc, 0) - 1, we_counts.get(max_doc, 0)
+                    if abs(min_wd - min_we) >= 2 or abs(max_wd - max_we) >= 2:
+                        continue
 
                     # 入れ替え
                     df.at[ridx, hosp] = min_doc
@@ -5397,6 +5435,10 @@ def validate_absolute_constraints(pattern_df, verbose=True):
     - ABS-009: 未割当禁止
     - ABS-010: TARGET_CAP遵守
     - ABS-011: 大学系2回まで
+    - ABS-012: 大学系7日間隔（v6.5.8）
+    - ABS-013: C-H列カテ当番必須（v6.5.9で検証追加・固定割当は許容）
+    - ABS-014: 平日/休日偏り差<=1
+    - ABS-015: 属性2のB列カテ表コード欠如
 
     Returns:
         (violations_list, is_valid)
@@ -5520,6 +5562,28 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                     "type": "ABS-012",
                     "desc": f"大学系7日間隔違反: {doc} → gap={gap}日 (必須>=7)"
                 })
+
+    # v6.5.9: ABS-013 C-H列（休日大学系）カテ当番必須チェック
+    # 従来この検証が欠落しており、fix関数がABS-013を壊しても
+    # 「絶対禁忌クリア」と表示され得た。固定割当（fixed）は意図的な
+    # 配置として許容（evaluate側のch_kate_violationsと同一の扱い）
+    for (ridx, hosp), (date, fixed) in slot_meta.items():
+        if fixed:
+            continue
+        hidx = shift_df.columns.get_loc(hosp)
+        if not is_ch_slot(hidx):
+            continue
+        val = pattern_df.at[ridx, hosp]
+        if not isinstance(val, str):
+            continue
+        doc = normalize_name(val)
+        if doc not in doctor_names:
+            continue
+        if not is_eligible_for_ch_slot(doc, date):
+            violations.append({
+                "type": "ABS-013",
+                "desc": f"C-H列カテ当番違反: {doc} → {date.strftime('%Y-%m-%d')} {hosp}"
+            })
 
     # ABS-014: 全体の平日/休日偏り（差>=2）チェック
     for doc in active_doctors:

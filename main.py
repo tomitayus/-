@@ -712,11 +712,15 @@ print(f"\n✅ Excel読込完了: 医師{len(doctor_names)}人 | 病院{len(hospi
 # 解釈できないマーク（非数値・未定義コード）は読込時に警告する。
 _invalid_avail_marks = []
 if isinstance(availability_df.index, pd.DatetimeIndex):
+    _missing_avail_cols = [d for d in doctor_names if d not in availability_df.columns]
+    if _missing_avail_cols:
+        print(f"⚠️ WARNING: sheet2に列が見つからない医師がいます（全日「可(1)」として扱われます）: {_missing_avail_cols}")
     for doc in doctor_names:
         if doc not in availability_df.columns:
             continue
         for _dt, _v in availability_df[doc].items():
-            if pd.isna(_v):
+            # NaT行（日付として解釈できない凡例・注記行）は対象外
+            if pd.isna(_v) or pd.isna(_dt):
                 continue
             try:
                 _f = float(_v)
@@ -762,8 +766,10 @@ def get_avail_code(date, doctor):
                 # 1.2は特別扱い：大学系優先
                 if abs(raw_value - 1.2) < 0.01:
                     code = 1.2
-                else:
+                elif raw_value in (0.0, 1.0, 2.0, 3.0):
                     code = int(raw_value)
+                # v6.5.9: 上記以外（0.5等）は解釈不能 → None（可(1)扱い、読込時に警告済み）
+                # 旧実装のint切り捨ては 0.5→不可(0) 等、警告文と矛盾する挙動だった
         except Exception:
             pass
     if code is None:

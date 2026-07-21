@@ -380,7 +380,9 @@ LOCAL_REFRESH_EVERY = 200     # 問題医師（gap/重複）を再抽出する�
 # v6.0.0 スコア重み（ソフト制約のみ）
 # 絶対禁忌(ABS)とハード制約(HARD)は候補選定時にチェック済み
 W_FAIR_TOTAL = getattr(_cfg, 'W_FAIR_TOTAL', 30)
-W_FAIR_CUM = getattr(_cfg, 'W_FAIR_CUM', 10)  # v6.5.9: 累計（前月+今月）公平性
+W_FAIR_CUM = getattr(_cfg, 'W_FAIR_CUM', 0)  # v6.5.9: 累計（前月+今月）公平性。既定0=表示のみ
+# 注: EXTRA枠は「若手（名簿末尾）が担う」運用のため累計は若手側に多く蓄積するのが設計どおり。
+# 累計均等化を優先したい場合のみconfig.pyでW_FAIR_CUM>0を設定する。
 W_CODE_12_UNIV = getattr(_cfg, 'W_CODE_12_UNIV', 150)
 W_BG_HT_DIFF = getattr(_cfg, 'W_BG_HT_DIFF', 100)
 # 以下は絶対禁忌のためペナルティ不要（v6.0.0）
@@ -1078,35 +1080,27 @@ BASE_TARGET = total_slots // len(active_doctors)
 EXTRA_SLOTS = total_slots - BASE_TARGET * len(active_doctors)
 
 # 余り枠(EXTRA)は属性1の医師から優先的に選出する
-# v6.5.9: 同一優先度内では前月累積（全合計）が最少の医師から選出
-#   - 旧実装のSheet2末尾順は位置ベースで、累積最多の医師に+1が付き
-#     月をまたいだ公平性が逆行するケースがあった
+# v6.5.8: 属性1の医師を優先、不足時はSheet2末尾からフォールバック
+# 【運用ルール】名簿末尾（=若手）から+1回を担う。末尾順は意図的な序列であり
+#   位置ベースの恣意ではない（v6.5.9で一時的に前月累積順へ変更したが復元）
 # v6.0.5: CODE_2医師もEXTRA対象に含める
 #   - CODE_2除外だと、他医師の制約(gap/dup等)で枠が埋まらず未割当が発生する
 #   - CODE_2医師のn+1回目はB〜Q列（大学系）に割り当てればよい
 active_sorted_by_index = sorted(active_doctors, key=lambda d: doctor_col_index[d])
 
-def _extra_priority(d):
-    """EXTRA枠の選出順: 前月累積（全合計）が少ない順 → Sheet2列順"""
-    return (prev_total.get(d, 0), doctor_col_index[d])
-
-# 属性1の医師をEXTRA候補として優先選出（前月累積最少順）
+# 属性1の医師をEXTRA候補として優先選出（Sheet2末尾順=若手から）
 attr1_doctors = [d for d in active_sorted_by_index if doctor_attribute.get(d, "") == "1"]
-attr1_by_prev = sorted(attr1_doctors, key=_extra_priority)
-non_attr1_by_prev = sorted(
-    [d for d in active_sorted_by_index if d not in attr1_doctors], key=_extra_priority
-)
-if EXTRA_SLOTS > 0 and len(attr1_by_prev) >= EXTRA_SLOTS:
-    # 属性1の医師で十分 → 前月累積が少ない順にEXTRA_SLOTS人を選出
-    EXTRA_ALLOWED = set(attr1_by_prev[:EXTRA_SLOTS])
-elif EXTRA_SLOTS > 0 and attr1_by_prev:
-    # 属性1だけでは不足 → 属性1全員 + 残りを前月累積最少の非属性1から補充
-    remaining = EXTRA_SLOTS - len(attr1_by_prev)
-    EXTRA_ALLOWED = set(attr1_by_prev) | set(non_attr1_by_prev[:remaining])
+if EXTRA_SLOTS > 0 and len(attr1_doctors) >= EXTRA_SLOTS:
+    # 属性1の医師で十分 → 末尾からEXTRA_SLOTS人を選出
+    EXTRA_ALLOWED = set(attr1_doctors[-EXTRA_SLOTS:])
+elif EXTRA_SLOTS > 0 and attr1_doctors:
+    # 属性1だけでは不足 → 属性1全員 + 残りをSheet2末尾の非属性1から補充
+    remaining = EXTRA_SLOTS - len(attr1_doctors)
+    non_attr1 = [d for d in active_sorted_by_index if d not in attr1_doctors]
+    EXTRA_ALLOWED = set(attr1_doctors) | set(non_attr1[-remaining:])
 else:
-    # 属性1がいない場合は前月累積最少からフォールバック
-    _all_by_prev = sorted(active_sorted_by_index, key=_extra_priority)
-    EXTRA_ALLOWED = set(_all_by_prev[:EXTRA_SLOTS] if EXTRA_SLOTS > 0 else [])
+    # 属性1がいない場合はSheet2末尾からフォールバック
+    EXTRA_ALLOWED = set(active_sorted_by_index[-EXTRA_SLOTS:] if EXTRA_SLOTS > 0 else [])
 
 TARGET_CAP = {d: 0 for d in doctor_names}
 for d in active_doctors:
@@ -1147,9 +1141,13 @@ if gap3_cap_adjusted > 0:
 total_cap = sum(TARGET_CAP[d] for d in active_doctors)
 shortage = total_slots - total_cap
 if shortage > 0:
-    # 属性1の医師に優先的に再配分、同一優先度内は前月累積が少ない順（v6.5.9）
-    _redist_candidates = attr1_by_prev + non_attr1_by_prev
-    for d in _redist_candidates:
+    # 属性1の医師に優先的に再配分、次にSheet2末尾順（=若手から）
+    _redist_candidates = (
+        [d for d in active_sorted_by_index if doctor_attribute.get(d, "") == "1"]
+        + [d for d in active_sorted_by_index if doctor_attribute.get(d, "") != "1"]
+    )
+    # 末尾（後方=若手）の医師から配分するため逆順
+    for d in reversed(_redist_candidates):
         if shortage <= 0:
             break
         max_gap3 = compute_max_gap3_assignments(d)

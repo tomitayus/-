@@ -1,4 +1,4 @@
-# 当直くん v6.5.6 - ローカル実行版
+# 当直くん - ローカル実行版（現行版数は VERSION 定数を参照）
 # 元のGoogle Colabノートブックをローカル実行用に変換したものです。
 # 詳細なバージョン履歴は VERSION_HISTORY.md を参照してください。
 # 修正内容:
@@ -37,7 +37,8 @@
 #   - Sheet1:Z列「カテ当番」を病院列から除外し、チーム当番日として使用
 #   - Sheet4:B列「属性」からカテチーム属性を読み込み
 #   - get_sched_code()をSheet1:Z + Sheet4:属性で判定（Sheet3でオーバーライド）
-#   - Sheet2の休み希望（1,2,3優先度）に対応（空欄=制約なし、0=不可、1=最優先休み、2=できれば休み、3=可能なら休み）
+#   - Sheet2の可否コードに対応（0=不可, 1=可, 1.2=大学優先, 2=大学専用, 3=外病院専用, 空欄=可）
+#     ※旧記述「休み希望1,2,3優先度」は現行仕様と正反対の誤りのためv6.8.0で訂正。正本はdocs/CONSTRAINT_RULES.md §1.3
 #   - 出張曜日の前日を自動的に不可（0）として扱う
 # - 大学系7日間隔ルールに変更（ABS-012改）
 #   - 日曜〜土曜の週単位から「7日以内に2回禁止」に変更
@@ -338,7 +339,7 @@ from collections import defaultdict
 import random
 
 # バージョン定数
-VERSION = "6.5.9"
+VERSION = "6.8.0"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -639,7 +640,46 @@ else:
     schedule_df = pd.DataFrame()
     date_col_sched = None
 
-# config.py の祝日をセットに追加
+# =========================
+# 祝日の自動取得（v6.8.0）
+# 優先順: jpholidayライブラリ → 内蔵祝日表(2026-2027)。config.HOLIDAYSは常に追加マージ
+# 旧実装はconfig.HOLIDAYS（既定空）のみで、書き忘れると祝日が平日扱いになり
+# 休日判定・ABS-014・枠分類が静かに歪んでいた
+# =========================
+_BUILTIN_HOLIDAYS = [
+    # 2026年（内閣府発表の国民の祝日・休日）
+    "2026-01-01", "2026-01-12", "2026-02-11", "2026-02-23", "2026-03-20",
+    "2026-04-29", "2026-05-03", "2026-05-04", "2026-05-05", "2026-05-06",
+    "2026-07-20", "2026-08-11", "2026-09-21", "2026-09-22", "2026-09-23",
+    "2026-10-12", "2026-11-03", "2026-11-23",
+    # 2027年
+    "2027-01-01", "2027-01-11", "2027-02-11", "2027-02-23", "2027-03-21",
+    "2027-03-22", "2027-04-29", "2027-05-03", "2027-05-04", "2027-05-05",
+    "2027-07-19", "2027-08-11", "2027-09-20", "2027-09-23", "2027-10-11",
+    "2027-11-03", "2027-11-23",
+]
+_sched_dates_for_holiday = pd.to_datetime(shift_df[date_col_shift], errors="coerce").dropna()
+_holiday_source = "config.pyのみ"
+_target_ym = set()
+if len(_sched_dates_for_holiday) > 0:
+    _target_ym = {(d.year, d.month) for d in _sched_dates_for_holiday}
+    try:
+        import jpholiday
+        for _y, _m in sorted(_target_ym):
+            for _hd, _hname in jpholiday.month_holidays(_y, _m):
+                HOLIDAYS.add(pd.Timestamp(_hd))
+        _holiday_source = "jpholiday（自動）"
+    except ImportError:
+        for _hs in _BUILTIN_HOLIDAYS:
+            _ht = pd.Timestamp(_hs)
+            if (_ht.year, _ht.month) in _target_ym:
+                HOLIDAYS.add(_ht)
+        _holiday_source = "内蔵祝日表(2026-2027)"
+        if any(_y > 2027 for _y, _m in _target_ym):
+            print("⚠️ WARNING: 2028年以降の祝日は内蔵表にありません。"
+                  "`pip install jpholiday` または config.HOLIDAYS への手動追加が必要です")
+
+# config.py の祝日をセットに追加（手動追加・上書き用）
 for _h in _cfg.HOLIDAYS:
     HOLIDAYS.add(pd.Timestamp(_h))
 # 🔧 FIX: 祝日もタイムゾーン正規化
@@ -647,6 +687,14 @@ HOLIDAYS = {pd.to_datetime(d).normalize().tz_localize(None) for d in HOLIDAYS}
 
 def is_holiday(date):
     return pd.to_datetime(date).normalize().tz_localize(None) in HOLIDAYS
+
+# 対象期間内の祝日を明示（自動検出の確認用）
+if _target_ym:
+    _period_holidays = sorted(h for h in HOLIDAYS if (h.year, h.month) in _target_ym)
+    if _period_holidays:
+        print(f"📅 祝日（{_holiday_source}）: " + ", ".join(h.strftime("%m/%d") for h in _period_holidays))
+    else:
+        print(f"📅 対象期間に祝日なし（{_holiday_source}）")
 
 # =========================
 # 基本情報
@@ -1397,6 +1445,12 @@ def choose_doctor_for_slot(
     is_CH_only = (C_COL_INDEX <= idx <= H_COL_INDEX)  # SEMI-002対象
     dow = pd.to_datetime(date).weekday()
     weekday = dow < 5
+    # v6.8.0: このスロットの平日/休日分類（ABS-014用、recompute_statsと同一ロジック）
+    slot_is_holiday_flag = (
+        is_holiday(date)
+        or dow >= 5
+        or (weekday and idx in (C_COL_INDEX, D_COL_INDEX, F_COL_INDEX, G_COL_INDEX))
+    )
 
     def collect_candidates(
         relax_semi=False,  # v6.0.0: SEMI制約を緩和（sheet3「1」以外も許容）
@@ -1457,6 +1511,17 @@ def choose_doctor_for_slot(
             # ABS-010: TARGET_CAP遵守（n超過禁止）
             if not relax_abs and assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
+
+            # v6.8.0: ABS-014 平日/休日偏り（残枠で回復不能な偏りのみ排除）
+            # 割当途中の一時的な差2は残枠の逆側割当で回復し得るため、
+            # 「残枠を全て逆側に使っても差>=2が残る」場合のみ候補から外す。
+            # 従来この生成時フィルタが無く、ABS全クリア0/1000の一因だった
+            if not relax_abs:
+                _new_wd = assigned_weekday[doc] + (0 if slot_is_holiday_flag else 1)
+                _new_we = assigned_weekend[doc] + (1 if slot_is_holiday_flag else 0)
+                _remaining_cap = TARGET_CAP.get(doc, 0) - (assigned_count[doc] + 1)
+                if abs(_new_wd - _new_we) - max(0, _remaining_cap) >= 2:
+                    continue
 
             # ABS-011: 大学系2回まで（B-K列合計）
             if not relax_abs and is_BG and assigned_bg[doc] >= 2:
@@ -2897,7 +2962,7 @@ def build_doctor_diag(counts, bg_counts, ht_counts, wd_counts, we_counts, doc_as
 def build_metrics_df(score_clamped, raw_score, metrics):
     """スコアサマリーを日本語で生成（旧メトリクス）"""
     rows = [
-        {"項目": "総合スコア（0〜100）", "値": float(score_clamped), "説明": "制約違反のペナルティを100から引いた値（高いほど良い）"},
+        {"項目": "総合スコア（raw）", "値": float(raw_score), "説明": "100−ペナルティ合計。マイナス値あり。パターン間の相対比較用（大きいほど良い）"},
         {"項目": "ペナルティ合計", "値": float(metrics.get("penalty_total", 0)), "説明": "全制約違反のペナルティ合計（低いほど良い）"},
         {"項目": "--- 制約違反 ---", "値": "", "説明": ""},
         {"項目": "未割当枠", "値": int(metrics.get("unassigned_slots", 0)), "説明": "医師が割り当てられていないスロット数"},
@@ -6502,6 +6567,30 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     for ws in writer.book.worksheets:
         if not ws.title.endswith("_summary"):
             _auto_format_sheet(ws)
+
+    # v6.8.0: pattern_XXシート先頭に警告バナー
+    # 「参考用（違反残存）」の性質がExcel単体で伝わらず、未修正のまま
+    # 医局配布される事故を防ぐ。列幅自動調整の後に挿入し幅計算へ影響させない
+    from openpyxl.styles import Font as _BFont, PatternFill as _BFill
+    for _rank, _entry in enumerate(top_patterns, start=1):
+        _slabel = f"pattern_{_rank:02d}"
+        if _slabel not in writer.book.sheetnames:
+            continue
+        _pws = writer.book[_slabel]
+        _n_viol = len(_entry.get("absolute_violations", []))
+        _pws.insert_rows(1)
+        if _n_viol > 0:
+            _btext = f"⚠️ 参考用: 絶対禁忌違反 {_n_viol}件 残存 — 該当箇所は {_slabel}_summary の違反テーブルを確認して手直ししてください"
+            _bfill = _BFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+            _bfont = _BFont(bold=True, color="9C6500")
+        else:
+            _btext = f"✅ 絶対禁忌チェック全クリア（診断は {_slabel}_summary 参照）"
+            _bfill = _BFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+            _bfont = _BFont(bold=True, color="375623")
+        _bcell = _pws.cell(row=1, column=1, value=_btext)
+        _bcell.font = _bfont
+        for _ci in range(1, min(_pws.max_column, 10) + 1):
+            _pws.cell(row=1, column=_ci).fill = _bfill
 
 print("\n" + "="*60)
 print("  完了")

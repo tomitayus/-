@@ -335,7 +335,7 @@ import sys
 import os
 import pandas as pd
 import numpy as np
-from collections import defaultdict
+from collections import Counter, defaultdict
 import random
 
 # バージョン定数
@@ -491,6 +491,200 @@ def is_slot_value(v) -> bool:
     return False
 
 # =========================
+# 氏名突合（v6.9.0向け: 完全一致のみ + NAME_ALIASES）
+# =========================
+def apply_name_alias(name):
+    """config.NAME_ALIASES（表記ゆれの手動マップ）を適用した正規化名を返す。
+
+    エイリアスはキー・値とも正規化してから引くため、
+    「冨田」→「富田」のどちら向きに書かれていても突合できる。
+    """
+    n = normalize_name(name)
+    aliases = getattr(_cfg, "NAME_ALIASES", {}) or {}
+    for k, v in aliases.items():
+        if normalize_name(k) == n:
+            return normalize_name(v)
+    return n
+
+def build_prev_name_matcher(prev_names_list):
+    """sheet4（前月累積）氏名との突合関数を作る。
+
+    v6.9.0向け: NAME_ALIASES適用後の**完全一致のみ**。
+    旧実装の「双方向startswith」は同姓医師（佐藤彰/佐藤悠/佐藤勇 等）で
+    誤マッチ・誤累積の危険があったため撤去。表記ゆれは config.NAME_ALIASES で手動対応する。
+
+    Returns:
+        match(doc) -> sheet4側の氏名（一致なしなら None）
+    """
+    raw_names = {str(p) for p in prev_names_list}
+    canon = {}
+    for p in prev_names_list:
+        canon.setdefault(apply_name_alias(p), str(p))
+
+    def match(doc):
+        if doc in raw_names:
+            return doc
+        return canon.get(apply_name_alias(doc))
+
+    return match
+
+# =========================
+# 実行前プリフライト検証（v6.9.0向け）
+# =========================
+def preflight_validate(shift_df, date_col_shift, availability_df, doctor_names,
+                       hospital_cols, holidays, name_match,
+                       invalid_avail_marks=None, missing_avail_cols=None):
+    """入力読込直後の一括検証。致命は ValueError で停止、警告は表示して続行する。
+
+    致命（例外で停止）:
+      - sheet1 の日付の重複・欠落（期間内の抜け）
+      - sheet2 の日付の重複
+      - sheet1 にあって sheet2 に無い日付
+        （旧実装は黙って全員「可(1)」フォールバックする最悪の静かな壊れ方だった）
+      - 総枠数 > 全医師の割当理論上限（gap>=3のもとで物理的に埋まらない）
+    警告（続行）:
+      - sheet2 の解釈できないマーク / 列が見つからない医師
+      - sheet4（前月累積）氏名突合の不一致（前月累積0扱いになる）
+      - 祝日と認識されていない平日に祝日枠（列名に「祝日」）が存在（祝日設定漏れの疑い）
+      - sheet2 にあって sheet1 に無い日付（無視される）
+
+    Returns:
+        (fatals, warnings): 致命・警告メッセージのリスト（致命があれば raise 済みのため戻らない）
+    """
+    fatals = []
+    warnings = []
+    doctor_set = set(doctor_names)
+
+    # ---- sheet1 日付: 重複・欠落 ----
+    s1_dates = [pd.Timestamp(d).normalize() for d in shift_df[date_col_shift] if pd.notna(d)]
+    _c1 = Counter(s1_dates)
+    dup1 = sorted(d for d, n in _c1.items() if n > 1)
+    if dup1:
+        fatals.append("sheet1に重複した日付があります: "
+                      + ", ".join(d.strftime("%Y-%m-%d") for d in dup1))
+    uniq1 = sorted(_c1.keys())
+    if uniq1:
+        expected = pd.date_range(uniq1[0], uniq1[-1], freq="D")
+        missing_days = [d for d in expected if d not in _c1]
+        if missing_days:
+            shown = ", ".join(d.strftime("%Y-%m-%d") for d in missing_days[:10])
+            more = f" 他{len(missing_days) - 10}件" if len(missing_days) > 10 else ""
+            fatals.append(f"sheet1の日付に欠落があります"
+                          f"（{uniq1[0]:%Y-%m-%d}〜{uniq1[-1]:%Y-%m-%d}の連続を想定）: {shown}{more}")
+
+    # ---- sheet2 日付: 重複・sheet1との集合不一致 ----
+    if isinstance(availability_df.index, pd.DatetimeIndex):
+        s2_dates = [pd.Timestamp(d).normalize() for d in availability_df.index if pd.notna(d)]
+    else:
+        s2_dates = []
+    _c2 = Counter(s2_dates)
+    dup2 = sorted(d for d, n in _c2.items() if n > 1)
+    if dup2:
+        fatals.append("sheet2に重複した日付があります: "
+                      + ", ".join(d.strftime("%Y-%m-%d") for d in dup2))
+    s2_set = set(_c2.keys())
+    miss_in_2 = [d for d in uniq1 if d not in s2_set]
+    if miss_in_2:
+        shown = ", ".join(d.strftime("%Y-%m-%d") for d in miss_in_2[:10])
+        more = f" 他{len(miss_in_2) - 10}件" if len(miss_in_2) > 10 else ""
+        fatals.append(f"sheet1にあってsheet2(可否)に無い日付があります"
+                      f"（この日は全員「可(1)」として黙って処理されてしまうため停止）: {shown}{more}")
+    extra_in_2 = sorted(s2_set - set(uniq1))
+    if extra_in_2:
+        shown = ", ".join(d.strftime("%Y-%m-%d") for d in extra_in_2[:10])
+        more = f" 他{len(extra_in_2) - 10}件" if len(extra_in_2) > 10 else ""
+        warnings.append(f"sheet2にあってsheet1に無い日付（無視されます）: {shown}{more}")
+
+    # ---- 総枠数カウント + 祝日枠の整合 ----
+    total_slots = 0
+    preassigned_cnt = {d: 0 for d in doctor_names}
+    holiday_col_bad = []
+    for ridx in shift_df.index:
+        dt = shift_df.at[ridx, date_col_shift]
+        if pd.isna(dt):
+            continue
+        dt = pd.Timestamp(dt).normalize()
+        for hosp in hospital_cols:
+            val = shift_df.at[ridx, hosp]
+            val_str = normalize_name(val) if isinstance(val, str) else ""
+            is_pre = val_str in doctor_set
+            if is_pre:
+                preassigned_cnt[val_str] += 1
+            if is_pre or is_slot_value(val):
+                total_slots += 1
+                if "祝日" in str(hosp) and dt.weekday() < 5 and dt not in holidays:
+                    holiday_col_bad.append((dt, str(hosp)))
+    if holiday_col_bad:
+        shown = ", ".join(f"{d:%Y-%m-%d}({h})" for d, h in holiday_col_bad[:5])
+        more = f" 他{len(holiday_col_bad) - 5}件" if len(holiday_col_bad) > 5 else ""
+        warnings.append("祝日と認識されていない平日に祝日枠（列名に「祝日」）があります"
+                        f"（祝日設定漏れの可能性・config.HOLIDAYSを確認）: {shown}{more}")
+
+    # ---- 総枠数 > 理論上限（gap>=3 greedy）----
+    def _avail_ok(dt, doc):
+        """sheet2生値ベースの可否。0のみ不可・空欄/解釈不能は可（v6.5.9仕様と同じ）"""
+        if not isinstance(availability_df.index, pd.DatetimeIndex) or doc not in availability_df.columns:
+            return True
+        try:
+            v = availability_df.at[dt, doc]
+        except Exception:
+            return True
+        if isinstance(v, pd.Series):
+            v = v.iloc[0]
+        if pd.isna(v):
+            return True
+        try:
+            return float(v) != 0.0
+        except (TypeError, ValueError):
+            return True
+
+    cap_upper = 0
+    for doc in doctor_names:
+        last = None
+        c = 0
+        for dt in uniq1:
+            if _avail_ok(dt, doc) and (last is None or (dt - last).days >= 3):
+                c += 1
+                last = dt
+        cap_upper += max(c, preassigned_cnt.get(doc, 0))
+    if total_slots > cap_upper:
+        fatals.append(f"総枠数{total_slots}が全医師の割当理論上限{cap_upper}を超えています"
+                      "（gap>=3制約のもとで物理的に埋まりません。枠数または可否(0)の見直しが必要）")
+
+    # ---- 既存警告の統合（sheet2不正マーク・列欠落）----
+    if missing_avail_cols:
+        warnings.append(f"sheet2に列が見つからない医師（全日「可(1)」扱い）: {list(missing_avail_cols)}")
+    if invalid_avail_marks:
+        marks = list(invalid_avail_marks)
+        shown = ", ".join(f"{pd.to_datetime(t):%Y-%m-%d} {d}: {v!r}" for t, d, v in marks[:5])
+        more = f" 他{len(marks) - 5}件" if len(marks) > 5 else ""
+        warnings.append(f"sheet2に解釈できないマークが{len(marks)}件（全て「可(1)」扱い）: {shown}{more}")
+
+    # ---- 氏名突合サマリ ----
+    matched = [d for d in doctor_names if name_match.get(d)]
+    unmatched = [d for d in doctor_names if not name_match.get(d)]
+    if unmatched:
+        warnings.append(f"sheet4(前月累積)と氏名が一致しない医師（前月累積が0扱いになります）: {unmatched}"
+                        " ※表記ゆれは config.NAME_ALIASES で対応可")
+
+    # ---- 表示 ----
+    print("\n━━━━━━━━━━ プリフライト検証 ━━━━━━━━━━")
+    print(f"📋 氏名突合(sheet4前月累積): 一致{len(matched)}人 / 不一致{len(unmatched)}人")
+    if warnings:
+        for w in warnings:
+            print(f"⚠️ 警告: {w}")
+    else:
+        print("✅ 警告なし")
+    if fatals:
+        for f in fatals:
+            print(f"❌ 致命: {f}")
+        print("━" * 24)
+        raise ValueError("プリフライト検証で致命的な問題が見つかりました:\n- " + "\n- ".join(fatals))
+    print(f"✅ 致命チェックOK（日付整合・総枠数{total_slots} ≦ 理論上限{cap_upper}）")
+    print("━" * 24)
+    return fatals, warnings
+
+# =========================
 # sheet4 読み込み（ヘッダ行自動検出＋重複耐性）
 # 🔧 FIX: 検索範囲を30→50行に拡大
 # =========================
@@ -628,7 +822,11 @@ def run(input_path, output_dir=None, num_patterns=None):
 
     missing = [k for k, v in [("sheet1", sheet1_name), ("sheet2", sheet2_name), ("sheet4/医師情報", sheet4_name)] if v is None]
     if missing:
-        raise ValueError(f"必要なシートが見つかりません: {missing}\n実際のシート名: {xls.sheet_names}")
+        # v6.9.0向け: プリフライト致命扱い（シートが無いと以降の検証自体ができないためここで停止）
+        print("\n━━━━━━━━━━ プリフライト検証 ━━━━━━━━━━")
+        print(f"❌ 致命: 必要なシートが見つかりません: {missing}")
+        print("━" * 24)
+        raise ValueError(f"プリフライト: 必要なシートが見つかりません: {missing}\n実際のシート名: {xls.sheet_names}")
 
     # --------- Excel 読み込み ---------
     shift_df = strip_cols(pd.read_excel(xls, sheet_name=sheet1_name))
@@ -794,11 +992,11 @@ def run(input_path, output_dir=None, num_patterns=None):
     # 月初の 0/2/3 マークが全月へ伝播し、休み希望・列制限が意図せず拡大していた
     # （例: 1日だけ0を書いた医師が全月不可=inactive扱いになる）。
     # 解釈できないマーク（非数値・未定義コード）は読込時に警告する。
+    # v6.9.0向け: ここでは収集のみ行い、表示はプリフライト検証ブロックに統合
     _invalid_avail_marks = []
+    _missing_avail_cols = []
     if isinstance(availability_df.index, pd.DatetimeIndex):
         _missing_avail_cols = [d for d in doctor_names if d not in availability_df.columns]
-        if _missing_avail_cols:
-            print(f"⚠️ WARNING: sheet2に列が見つからない医師がいます（全日「可(1)」として扱われます）: {_missing_avail_cols}")
         for doc in doctor_names:
             if doc not in availability_df.columns:
                 continue
@@ -813,12 +1011,6 @@ def run(input_path, output_dir=None, num_patterns=None):
                     _ok = False
                 if not _ok:
                     _invalid_avail_marks.append((_dt, doc, _v))
-    if _invalid_avail_marks:
-        print(f"⚠️ WARNING: sheet2に解釈できないマークが{len(_invalid_avail_marks)}件あります → 全て「可(1)」として扱われます:")
-        for _dt, _doc, _v in _invalid_avail_marks[:10]:
-            print(f"   - {pd.to_datetime(_dt).strftime('%Y-%m-%d')} {_doc}: {_v!r}")
-        if len(_invalid_avail_marks) > 10:
-            print(f"   ... 他{len(_invalid_avail_marks) - 10}件")
 
     def get_avail_code(date, doctor):
         """可否コードを取得
@@ -921,16 +1113,22 @@ def run(input_path, output_dir=None, num_patterns=None):
     name_to_row = {row["氏名"]: row for _, row in sheet4_data.iterrows()}
     prev_names = list(sheet4_data["氏名"])
 
-    def match_prev_name(doc):
-        if doc in name_to_row:
-            return doc
-        ms = [p for p in prev_names if str(p).startswith(doc) or doc.startswith(str(p))]
-        return ms[0] if len(ms) == 1 else None
+    # v6.9.0向け: NAME_ALIASES適用後の完全一致のみ（旧: 双方向startswithは同姓医師で誤マッチの危険）
+    match_prev_name = build_prev_name_matcher(prev_names)
 
     name_match = {doc: match_prev_name(doc) for doc in doctor_names}
     unmatched = [d for d in doctor_names if name_match.get(d) is None]
-    if unmatched:
-        print(f"⚠️ WARNING: sheet4(累積)で名前が一致しない医師がいます（累積が0扱いになります）: {unmatched}")
+
+    # =========================
+    # 実行前プリフライト検証（v6.9.0向け）
+    # 致命（日付不整合・枠数超過等）は例外で停止、警告（氏名不一致等）は表示して続行
+    # =========================
+    preflight_validate(
+        shift_df, date_col_shift, availability_df, doctor_names,
+        hospital_cols, HOLIDAYS, name_match,
+        invalid_avail_marks=_invalid_avail_marks,
+        missing_avail_cols=_missing_avail_cols,
+    )
 
     def prev_get(doc, colname):
         pname = name_match.get(doc)

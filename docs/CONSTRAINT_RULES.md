@@ -1,8 +1,13 @@
-# 当直くん v6.5 制約仕様書
+# 当直くん 制約仕様書（v6.9.0時点）
 
 > 本ドキュメントは制約ルールの完全な定義を提供します。
-> 実装コード（正本）: `main.py`（現行版数はmain.pyのVERSION定数を参照）
-> ※`colab_duty_scheduler.py`(v6.7.0)は旧Colab版で、v6.5.9以降の公平性修正を含まない
+> 実装コード（正本）:
+> - **制約ID登録簿・可否コード判定・スコア重み**: `main.py`（現行版数は `VERSION` 定数＝6.9.0）
+> - **絶対禁忌(ABS)の最終定義**: `main.py::validate_absolute_constraints()`（ABS-001〜015を実際に検査する関数）
+> - **ソフト制約(SOFT)の適用重み**: `main.py::evaluate_schedule_with_raw()`（penalty加算そのもの）
+> - **既定ソルバ（v6.9.0〜）**: `solver_cpsat.py`（CP-SAT厳密解）。ABS/SEMIをハード制約として直接モデル化し、
+>   本書のSOFT重みで目的関数を最小化する。Greedyエンジンはフォールバック（後述 §6）。
+> ※旧Colab版 `colab_duty_scheduler.py`(v6.7.0) は `docs/archive/` にアーカイブ済み。参照しないこと。
 
 ---
 
@@ -131,28 +136,45 @@ v6.5.0以降、カテ当番の判定は以下の2段階で行われる:
 | ABS-006 | 同日重複禁止 | 同一医師が同一日に2枠以上 | ロジックで排除 |
 | ABS-007 | gap>=3日必須 | 連続当直の間隔が3日未満 | `collect_candidates`で除外（v6.0.0: ABS格上げ） |
 | ABS-008 | 同一病院重複禁止 | 初期生成時は全列、fix関数では外病院のみ | `collect_candidates` / `is_valid_full_assignment` |
+| ABS-009 | 未割当禁止 | slot_metaの枠に医師が入っていない／不明医師名 | `fix_unassigned_slots`で最終補填・`validate_absolute_constraints`で検査 |
 | ABS-010 | TARGET_CAP厳守 | 割当回数がTARGET_CAPを超過 | `collect_candidates`で除外（v6.0.0: ABS格上げ） |
 | ABS-011 | 大学系2回まで | B-K列の合計が2回を超過 | `collect_candidates`で除外 |
 | ABS-012 | 大学系7日間隔必須 | 大学系割当の間隔が7日未満（v6.5.0） | `collect_candidates`で除外 |
 | ABS-013 | C-H列カテ当番必須 | 休日大学系にカテ当番日以外で配置（v6.5.3、旧SEMI-002格上げ） | `collect_candidates`で除外 |
+| ABS-014 | 平日/休日偏り差≤1 | 1医師の `|平日回数 − 休日回数| ≥ 2` | `is_valid_full_assignment` / 生成時フィルタ（v6.8.0）・`validate_absolute_constraints`で検査 |
 | ABS-015 | 属性2のB列カテ表必須 | 属性2医師がカテ表なしでB列に配置（v6.5.6） | `collect_candidates`で除外 |
+
+**補足:**
+- **ABS-009**（未割当禁止）は最も深刻な違反。fix_unassigned_slots が最終セーフティネットとして緊急フォールバックで埋める。物理的に埋まらない場合のみ未割当のまま残り、警告表示される。
+- **ABS-014**（平日/休日偏り差≤1）は evaluate 側では W=300 のソフト残留（`wd_we_imbalance_violations`）としても計上される（実質ハード）。
 
 **v5.2からの変更点:**
 - ABS-007, ABS-008, ABS-010: v6.0.0でSOFT/HARDからABS（絶対禁忌）に格上げ
+- ABS-009: v6.0.4で未割当を最終パスで直接補填する扱いに（`validate_absolute_constraints`で検査）
 - ABS-011, ABS-012: v6.0.0/v6.5.0で追加
 - ABS-013: v6.5.3でSEMI-002から格上げ
+- ABS-014: v6.8.0で生成時フィルタを追加（平日/休日偏り）
 - ABS-015: v6.5.6で追加
 
-### 2.2 ハード制約（パターン選択時の判定基準）
+> **コード正本**: 上表の完全な検査実装は `main.py::validate_absolute_constraints()`（ABS-001〜015を1関数で走査）。
+> `CONSTRAINT_ABS_00X` 定数（main.py §「制約ID定義」）は静的チェック用の一部IDのみを保持する（ABS-001〜006, 013, 015）。
 
-v6.0.0以降、ハード制約の多くはABS（絶対禁忌）に格上げされた。
-パターン選択時に以下の違反が多いパターンは低順位となる:
+### 2.2 ハード制約（レガシー・ほぼABSへ吸収済み）
 
-| ID | 制約名 | 違反判定 | 処理 |
-|----|--------|----------|------|
-| HARD-001 | B/I列1回まで | `assigned_bi[doc] >= 1` | グループA制約 |
-| HARD-002 | C-H/J-K列1回まで | `assigned_chjk[doc] >= 1` | グループB制約 |
-| HARD-003 | 未割当枠 | 空き枠が残存 | `fix_unassigned_slots`で修正 |
+v6.0.0以降、旧「HARD」制約の実体は **ほぼ全てABS（絶対禁忌）へ格上げ**された。
+`main.py` の `CONSTRAINT_HARD_00X` 定数は歴史的経緯で残るラベルであり、スコアリングには使われない。
+現行コードで「HARD」IDが指す内容（`CONSTRAINT_HARD_001〜004`, main.py §制約ID定義）は以下の通りだが、
+いずれも実際にはABS側で強制される:
+
+| ID | 定数上の意味 | 実際の強制先 |
+|----|-------------|-------------|
+| HARD-001 | TARGET_CAP超過 | ABS-010 |
+| HARD-002 | gap違反 | ABS-007 |
+| HARD-003 | 未割当枠 | ABS-009（`fix_unassigned_slots`） |
+| HARD-004 | CODE_2のn+1違反 | ABS-010（TARGET_CAPベース判定・SOFT `code_2_extra_violations` W=300でも計上） |
+
+> つまり運用上「ハード制約」という独立階層は事実上消滅している。B/I列・C-H/J-K列の「グループ1回まで」は
+> 現行では ABS-011（大学系2回まで）＋ ABS-012（大学系7日間隔）＋ evaluate側の `bg_over_2`/`bg_weekday_over` ペナルティで担保する。
 
 ### 2.3 準ハード制約（条件付き緩和可）
 
@@ -181,49 +203,55 @@ v6.0.0以降、ハード制約の多くはABS（絶対禁忌）に格上げさ�
 
 ### 2.4 ソフト制約（ペナルティ加算）
 
-#### 2.4.1 ほぼ禁忌（W>=300: 事実上のハード制約）
+> **コード正本 = `main.py::evaluate_schedule_with_raw()` の penalty 加算（main.py 2737〜2761行）**。
+> `raw_score = 100 − penalty`、`score = max(raw_score, 0)`。
+> 下表は実際に加算される全項目を「適用重み」で列挙したもの。
+> **重要**: main.py の `CONSTRAINT_SOFT_00X` 定数コメントの重み、config.py のコメント、本表は
+> 歴史的経緯で **ID割当が3系統に分裂している**。動作を規定するのは本表の「適用重み」列のみ。
+> ID列は参考（main.py定数ブロックの登録簿に対応、無いものは「—」）。
 
-| ID | 制約名 | ペナルティ重み | 説明 |
-|----|--------|---------------|------|
-| SOFT-001 | 外病院0回 | 300 | active医師は外病院最低1回必須 |
-| SOFT-002 | 大学3回以上 | 300 | `bg_count >= 3`（CC除く） |
-| SOFT-003 | CODE_2医師CAP超過 | 300 | CODE_2医師のTARGET_CAP超過 |
-| SOFT-004 | 全体平日/休日偏り | 300 | 平日/休日差が2以上 |
-| SOFT-005 | 休日0回 | 300 | active医師で休日割当0回 |
-| SOFT-006 | 大学系週1違反 | 300 | ABS-012の残留違反 |
+| 適用重み | メトリクス（変数名） | 対象 | 定数/ID | 由来 |
+|---------|---------------------|------|---------|------|
+| **500** | `unassigned_slots` | 未割当スロット数 | `W_UNASSIGNED` | ABS-009（最優先。事実上ハード） |
+| **300** | `code_2_extra_violations` | CODE_2医師のTARGET_CAP超過 | ハードコード | HARD-004→ABS-010 |
+| **300** | `bg_over_2_violations` | 大学系3回以上（CC除外）の超過分 | ハードコード | SOFT-002相当・大学3回以上 |
+| **300** | `ht_0_violations` | 外病院0回かつ大学≥1回 | ハードコード | SOFT-001相当・外病院0回 |
+| **300** | `weekly_bg_violations` | 大学系7日間隔違反（残留分） | ハードコード | ABS-012残留 |
+| **300** | `wd_we_imbalance_violations` | 平日/休日差≥2の超過分 | ハードコード | ABS-014残留 |
+| **300** | `we_0_violations` | 休日0回かつ総≥1回 | ハードコード | 休日0回（事実上ハード） |
+| **150** | `code_1_2_violations` | CODE_1.2医師が大学系0回 | ハードコード / `W_CODE_12_UNIV`(=150, greedy未使用) | 大学最低1回未達 |
+| **120** | `ch_kate_violations` | C-H列にカテ当番日以外で配置 | ハードコード | 休日大学系カテ当番（ABS-013の残留・固定割当は許容） |
+| **100** | `bg_ht_imbalance_violations` | 大学/外病院の差≥3（CC除外）超過分 | ハードコード / `W_BG_HT_DIFF`(=100, greedy未使用) | BG/HT不均衡 |
+| **80** | `bg_weekday_over_violations` | 大学の平日2回以上の超過分 | ハードコード | 大学平日偏り |
+| **50** | `bg_weekday_weekend_imbalance` | 大学2回で平日1+休日1でない | ハードコード | 大学2回バランス |
+| **30** | `fairness_penalty` | 全合計公平性（active・CC除外、差≥2で2倍） | `W_FAIR_TOTAL` | 公平性 |
+| **2** | `bk_ly_imbalance` | B-K/L-Y比率の偏り合計（コード3除外） | `W_BK_LY_BALANCE` | 比率バランス |
+| **0** | `cum_total_spread` | 累計（前月+今月）全合計spread | `W_FAIR_CUM`(既定0) | 累計公平性（>0で有効化・表示のみ） |
+| **0** | `gap_violations` | gap<3日 | `W_GAP` | ABS-007で強制済み |
+| **0** | `hosp_dup_violations` | 大学系同一病院重複 | `W_HOSP_DUP` | 許容 |
+| **0** | `external_hosp_dup_violations` | 外病院同一病院重複 | `W_EXTERNAL_HOSP_DUP` | ABS-008で強制済み |
+| **0** | `cap_violations` | TARGET_CAP超過 | `W_CAP` | ABS-010で強制済み |
+| **0** | `bg_spread`/`ht_spread`/`wd_spread`/`we_spread` | 累計ばらつき | `W_BG_SPREAD`他 | 簡略化で削除 |
 
-#### 2.4.2 中程度の回避（W=50-200）
+**注記:**
+- `code_1_2_violations`・`bg_ht_imbalance_violations` は evaluate 内でハードコード重み（150 / 100）が使われており、config.py の `W_CODE_12_UNIV`・`W_BG_HT_DIFF` は**現状 greedy スコアには反映されない**（値は同じ150/100なので実害なし。将来の整理対象）。
+- W=300群は「事実上のハード制約」。ABSで生成時に排除されるため通常0だが、緩和フォールバック経路で残った場合にスコアを強く下げる。
 
-| ID | 制約名 | ペナルティ重み | 説明 |
-|----|--------|---------------|------|
-| SOFT-007 | 未割当 | W_UNASSIGNED=500 | 未割当スロット（最優先修正対象） |
-| SOFT-008 | CODE_1.2大学0回 | 150 | 大学最低1回未達 |
-| SOFT-009 | C-Hカテ当番違反 | 120 | C-H列にカテ当番日以外で割当 |
-| SOFT-010 | BG/HT差3以上 | 100 | 大学と外病院の不均衡 |
-| SOFT-011 | 大学平日2回以上 | 80 | 平日偏り回避 |
-| SOFT-012 | 大学2回平日/休日バランス | 50 | 大学2回の場合、平日1+休日1が理想 |
-
-#### 2.4.3 軽微な非推奨（W=1-50）
-
-| ID | 制約名 | ペナルティ重み | 説明 |
-|----|--------|---------------|------|
-| SOFT-013 | 公平性 | W_FAIR_TOTAL=30 | `max(割当数) - min(割当数)` の差。差>=2で2倍ペナルティ |
-
-### 重み定数一覧（v6.0.0以降）
+### 重み定数一覧（main.py 383〜399行・config.py で上書き可）
 
 ```python
 # v6.0.0: GAP/CAP/外病院重複はABS（絶対禁忌）に格上げされペナルティ重み0
-W_FAIR_TOTAL = 30          # SOFT-013: 公平性（max-min最小化）
-W_HOSP_DUP = 0             # 大学重複（許容）
-W_GAP = 0                  # ABS-007で対応
-W_EXTERNAL_HOSP_DUP = 0    # ABS-008で対応
-W_UNASSIGNED = 500         # SOFT-007: 未割当ペナルティ
-W_CAP = 0                  # ABS-010で対応
-W_BG_SPREAD = 0            # 削除（簡略化）
-W_HT_SPREAD = 0            # 削除（簡略化）
-W_WD_SPREAD = 0            # 削除（簡略化）
-W_WE_SPREAD = 0            # 削除（簡略化）
-W_BK_LY_BALANCE = 0        # 削除（簡略化）
+W_FAIR_TOTAL   = getattr(_cfg, 'W_FAIR_TOTAL', 30)     # 公平性（max-min最小化）
+W_FAIR_CUM     = getattr(_cfg, 'W_FAIR_CUM', 0)        # v6.5.9: 累計公平性（既定0=表示のみ）
+W_CODE_12_UNIV = getattr(_cfg, 'W_CODE_12_UNIV', 150)  # ※greedyスコアはハードコード150を使用
+W_BG_HT_DIFF   = getattr(_cfg, 'W_BG_HT_DIFF', 100)    # ※greedyスコアはハードコード100を使用
+W_GAP                = 0    # ABS-007で対応
+W_HOSP_DUP           = 0    # 大学重複（許容）
+W_EXTERNAL_HOSP_DUP  = 0    # ABS-008で対応
+W_UNASSIGNED   = getattr(_cfg, 'W_UNASSIGNED', 500)    # 未割当ペナルティ
+W_CAP                = 0    # ABS-010で対応
+W_BG_SPREAD = W_HT_SPREAD = W_WD_SPREAD = W_WE_SPREAD = 0  # 削除（簡略化）
+W_BK_LY_BALANCE = getattr(_cfg, 'W_BK_LY_BALANCE', 2)  # B-K/L-Y比率バランス
 ```
 
 ---
@@ -325,10 +353,10 @@ inactive_doctors = [d for d in doctor_names if is_always_unavailable(d)]
 
 | カテゴリ | ID範囲 | 説明 |
 |---------|--------|------|
-| **ABS** | ABS-001〜015 | 絶対禁忌（配置不可） |
-| **HARD** | HARD-001〜003 | ハード制約（パターン選択時の判定基準） |
-| **SEMI** | SEMI-001 | 準ハード制約（緩和可） |
-| **SOFT** | SOFT-001〜013 | ソフト制約（ペナルティ） |
+| **ABS** | ABS-001〜015（009/014含む・欠番なし） | 絶対禁忌（配置不可）。定義=`validate_absolute_constraints()` |
+| **HARD** | HARD-001〜004（レガシー） | 実体はABSへ吸収済み（§2.2） |
+| **SEMI** | SEMI-001 | 準ハード制約（緩和可）。SEMI-002はABS-013へ格上げ済 |
+| **SOFT** | 適用重みで規定（§2.4） | ID体系は3系統に分裂・重みは `evaluate_schedule_with_raw()` が正本 |
 
 ### 列インデックス対応表
 
@@ -355,10 +383,32 @@ inactive_doctors = [d for d in doctor_names if is_always_unavailable(d)]
 
 ---
 
+## §6 ソルバーエンジンの切替（v6.9.0〜）
+
+`config.SOLVER` で当直表生成エンジンを選択する。
+
+| 値 | エンジン | 制約の扱い | 生成数 |
+|----|---------|-----------|--------|
+| `"cpsat"`（既定） | CP-SAT厳密解（`solver_cpsat.py`） | ABS/SEMIをハード制約として直接モデル化し、本書§2.4のSOFT重みで目的関数を最小化 | 常に3解（`NUM_PATTERNS`無視） |
+| `"greedy"` | 旧Greedy + fixパイプライン（`main.py`内） | ABSは候補選定/fixで強制、SOFTはevaluateでペナルティ加算 | `NUM_PATTERNS`個から上位3 |
+
+**フォールバック**: `SOLVER="cpsat"` でも次のいずれかで自動的にGreedyへ切替（stdoutに明示）:
+- `ortools` 未導入（ImportError）
+- INFEASIBLE / CP-SAT内部例外
+- CP-SATとmain.pyの `TARGET_CAP` / `EXTRA_ALLOWED` 不一致（二重パース整合性assert失敗）
+
+**合流点**: CP-SATの割当は main.py の `shift_df` 同型グリッド（`pattern_df`）へ転写され、
+以降の evaluate / summary / バナー / Excel出力は**両エンジンで共通**。したがってスコア・診断シートの意味は
+どちらのエンジンでも本書§2.4と一致する（CP-SAT解は通常 penalty が最小＝全ABS違反0）。
+実装: `main.py::run()` 6180〜6273行。
+
+---
+
 ## 更新履歴
 
 | 日付 | バージョン | 変更内容 |
 |------|-----------|---------|
+| 2026-07-22 | v6.9.0 | コード正本へ全面同期: §2.4 SOFTを `evaluate_schedule_with_raw()` の実適用重みで全面書き換え（3系統ID分裂を明記）、ABS-009/ABS-014を§2.1表に追加、§2.2 HARDをABS吸収済みとして整理、§6にCP-SAT/Greedy切替を追記、ヘッダのコード正本参照を更新（colab版はアーカイブ） |
 | 2026-02-12 | v6.5 | v6.x系の変更を反映: ABS-007/008/010のABS格上げ、ABS-011〜015追加、SEMI-002〜004削除（格上げ/統合）、重み定数をv6.0.0仕様に更新（GAP/CAP/外病院重複=0）、段階的制約緩和（relax_abs）、修正パイプライン更新、属性による緩和可否、safe_fixラッパー |
 | 2026-01-31 | v5.2 | 制約ID体系（ABS/HARD/SEMI/SOFT-XXX）を導入。緩和フラグ命名の歴史的経緯を注記。§1.2にJ-K列の設計背景を追記。§4.3の表記を「平日大学系」に統一。§6に制約ID一覧を追加 |
 | 2026-01-31 | v5.1 | ハード/ソフト境界を明確化（§2.2, §2.4再構成）。§1.5にSheet3コード定義追加。水曜日L〜Y禁止制約を§2.1に追加。CODE_1.2と準ハード#4の関係性を整理。修正パイプラインの順序根拠を追記 |

@@ -19,6 +19,9 @@ solver_cpsat.py — 当直くん CP-SAT厳密解ソルバー（併走版 Phase 1
   1. SEMI-001違反数最小化
   2. 月内公平性 max(割当数)-min(割当数) 最小化
   3. SOFT簡易版（外病院0回 / BG-HT差 / コード1.2大学0回）
+     ＋ ソフト層3件（v6.12.0）: 二層累計公平（外病院累計spread×W_FAIR_CUM_HT）/
+     ソフト回避（SOFT_AVOID_DOCTORS×W_SOFT_AVOID）/
+     カテ番×平日大学一致の加点（-W_KATE_WEEKDAY_BONUS）
 
 使い方:
     python3 solver_cpsat.py <input.xlsx> [--output-dir DIR]
@@ -88,12 +91,23 @@ try:
     GAIKIN_HOSPITAL_GROUPS = dict(getattr(_cfg, "GAIKIN_HOSPITAL_GROUPS", {}) or {})
     GAIKIN_EXCEPTIONS = dict(getattr(_cfg, "GAIKIN_EXCEPTIONS", {}) or {})
     TEAM_SLOT_RESTRICTIONS = list(getattr(_cfg, "TEAM_SLOT_RESTRICTIONS", []) or [])
+    # v6.12.0(提案#5/#9/#10): ソフト層3件（main.py と同一の既定値・無ければ従来動作）
+    W_FAIR_CUM_HT = getattr(_cfg, "W_FAIR_CUM_HT", 0)
+    CUM_FAIRNESS_EXEMPT = list(getattr(_cfg, "CUM_FAIRNESS_EXEMPT", []) or [])
+    SOFT_AVOID_DOCTORS = list(getattr(_cfg, "SOFT_AVOID_DOCTORS", []) or [])
+    W_SOFT_AVOID = getattr(_cfg, "W_SOFT_AVOID", 15)
+    W_KATE_WEEKDAY_BONUS = getattr(_cfg, "W_KATE_WEEKDAY_BONUS", 0)
 except Exception:
     WED_FORBIDDEN_DEFAULT = ["金城", "山田", "野寺"]
     CFG_HOLIDAYS = []
     GAIKIN_HOSPITAL_GROUPS = {}
     GAIKIN_EXCEPTIONS = {}
     TEAM_SLOT_RESTRICTIONS = []
+    W_FAIR_CUM_HT = 0
+    CUM_FAIRNESS_EXEMPT = []
+    SOFT_AVOID_DOCTORS = []
+    W_SOFT_AVOID = 15
+    W_KATE_WEEKDAY_BONUS = 0
 
 
 # =========================
@@ -452,6 +466,17 @@ class InputData:
             self.doctor_attribute = {d: get_str(d, "属性") for d in self.doctor_names}
         else:
             self.doctor_attribute = {d: "" for d in self.doctor_names}
+
+        # v6.12.0(提案#5): 前月累積「外病院合計」（二層累計公平で使用。列/値が無ければ0）
+        def get_num(doc, col):
+            p = name_match.get(doc)
+            row = name_to_row.get(p) if p else None
+            if row is None:
+                return 0
+            v = pd.to_numeric(row.get(col), errors="coerce")
+            return int(round(float(v))) if pd.notna(v) else 0
+
+        self.prev_ht = {d: get_num(d, "外病院合計") for d in self.doctor_names}
 
         # v6.11.0(提案#3/#4): 出張曜日（複数曜日・追加列対応）+ 出張先 + 例外ペア
         travel_wd_cols = find_travel_weekday_columns(sheet4_data.columns)
@@ -949,6 +974,7 @@ class CpSatScheduler:
         hosp_fixed = {d: defaultdict(int) for d in docs}
         semi_terms = {d: defaultdict(list) for d in docs}  # doc -> week -> vars
         all_semi_vars = []
+        kate_bonus_vars = []  # v6.12.0(提案#10): カテ番×平日大学一致の加点対象
 
         for si, slot in enumerate(data.slots):
             date, hidx, hosp = slot["date"], slot["hidx"], slot["hosp"]
@@ -958,6 +984,9 @@ class CpSatScheduler:
             is_bi = hidx in (B_COL, I_COL)
             is_chjk = (C_COL <= hidx <= H_COL) or (J_COL <= hidx <= K_COL)
             is_nichoku = hidx in NICHOKU_COLS  # v6.10.0: ABS-016
+            # v6.12.0(提案#10): 平日大学枠(B/I-K)＝カテ番と「できれば合わせる」対象
+            is_kate_wd_univ = ((hidx == B_COL or I_COL <= hidx <= K_COL)
+                               and date.weekday() < 5 and not data.is_holiday(date))
             if slot["fixed"]:
                 d = slot["doc"]
                 if d not in data.active_doctors:
@@ -1006,6 +1035,8 @@ class CpSatScheduler:
                     if data.is_semi001_relax_slot(slot, d):
                         semi_terms[d][monday_week_start(date)].append(v)
                         all_semi_vars.append(v)
+                    if is_kate_wd_univ and data.sched_code(date, d):
+                        kate_bonus_vars.append(v)
 
         # --- ABS-006: 同日重複禁止 ---
         for d in docs:
@@ -1142,6 +1173,41 @@ class CpSatScheduler:
                 b0 = m.NewBoolVar(f"bg0_{d}")
                 m.Add(sum(bg_terms[d]) + bg_fixed[d] >= 1 - b0)
                 soft_terms.append(self.W_SOFT_C12 * b0)
+
+        # --- v6.12.0(提案#9): ソフト回避医師（割当1回ごとに軽ペナルティ） ---
+        # モジュール属性を参照時に読む（テストの monkeypatch を有効にするため）
+        avoid_set = {normalize_name(x) for x in SOFT_AVOID_DOCTORS if normalize_name(x)}
+        if W_SOFT_AVOID > 0 and avoid_set:
+            for d in docs:
+                if d in avoid_set and cnt_terms[d]:
+                    soft_terms.append(W_SOFT_AVOID * sum(cnt_terms[d]))
+
+        # --- v6.12.0(提案#10): カテ番×平日大学の「できれば合わせる」加点 ---
+        if W_KATE_WEEKDAY_BONUS > 0 and kate_bonus_vars:
+            soft_terms.append(-W_KATE_WEEKDAY_BONUS * sum(kate_bonus_vars))
+
+        # --- v6.12.0(提案#5): 二層累計公平（方針③） ---
+        # 外病院(L-Y)の年度累計（Sheet3「外病院合計」+当月割当）の max-min spread を最小化。
+        # 単月の学年クォータ（等式制約）とは独立に「外病院の誰に割るか」の自由度で効く。
+        # CUM_FAIRNESS_EXEMPT（恒常的外勤過多などの恒常例外）は対象から除外。
+        self.cum_ht_over = None
+        if W_FAIR_CUM_HT > 0:
+            exempt_set = {normalize_name(x) for x in CUM_FAIRNESS_EXEMPT if normalize_name(x)}
+            fair_docs = [d for d in docs if d not in exempt_set]
+            if len(fair_docs) >= 2:
+                prev_max = max(int(data.prev_ht.get(d, 0)) for d in fair_docs)
+                ub = prev_max + max(data.target_cap.get(d, 0) for d in docs) + 1
+                cum_max = m.NewIntVar(0, ub, "cum_ht_max")
+                cum_min = m.NewIntVar(0, ub, "cum_ht_min")
+                for d in fair_docs:
+                    expr = sum(ht_terms[d]) + ht_fixed[d] + int(data.prev_ht.get(d, 0))
+                    m.Add(cum_max >= expr)
+                    m.Add(cum_min <= expr)
+                # Greedy evaluate と同じ「spread-1 の超過分」にペナルティ
+                over = m.NewIntVar(0, ub, "cum_ht_over")
+                m.Add(over >= cum_max - cum_min - 1)
+                self.cum_ht_over = over
+                soft_terms.append(W_FAIR_CUM_HT * over)
 
         m.Minimize(self.W_SEMI * self.semi_total
                    + self.W_FAIR * self.fair_span

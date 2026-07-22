@@ -340,7 +340,7 @@ import random
 import re
 
 # バージョン定数
-VERSION = "6.11.0"
+VERSION = "6.12.0"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -404,6 +404,13 @@ W_HT_SPREAD = 0            # 削除（簡略化）
 W_WD_SPREAD = 0            # 削除（簡略化）
 W_WE_SPREAD = 0            # 削除（簡略化）
 W_BK_LY_BALANCE = getattr(_cfg, 'W_BK_LY_BALANCE', 2)
+
+# v6.12.0(提案#5/#9/#10): ソフト層3件。configに項目が無ければ従来動作（重み0/空リスト）
+W_FAIR_CUM_HT = getattr(_cfg, 'W_FAIR_CUM_HT', 0)  # 外病院累計(前月+今月)spread均等化。0=無効
+CUM_FAIRNESS_EXEMPT = list(getattr(_cfg, 'CUM_FAIRNESS_EXEMPT', []) or [])  # 均等化対象外（恒常例外）
+SOFT_AVOID_DOCTORS = list(getattr(_cfg, 'SOFT_AVOID_DOCTORS', []) or [])    # ソフト回避医師
+W_SOFT_AVOID = getattr(_cfg, 'W_SOFT_AVOID', 15)   # ソフト回避: 割当1回ごとの軽ペナルティ
+W_KATE_WEEKDAY_BONUS = getattr(_cfg, 'W_KATE_WEEKDAY_BONUS', 0)  # カテ番×平日大学一致の加点。0=無効
 
 # =========================
 # 制約ID定義（v5.2仕様書準拠）
@@ -3006,6 +3013,11 @@ def run(input_path, output_dir=None, num_patterns=None):
     # =========================
     # スコア評価（raw_scoreも保持して 0 で潰れないように）
     # =========================
+    # v6.12.0(提案#5/#9): ソフト層設定の正規化済みセット
+    # （run()呼び出し時点のモジュール属性を読む＝テストのmonkeypatchが効く）
+    SOFT_AVOID_SET = {normalize_name(x) for x in SOFT_AVOID_DOCTORS if normalize_name(x)}
+    CUM_EXEMPT_SET = {normalize_name(x) for x in CUM_FAIRNESS_EXEMPT if normalize_name(x)}
+
     def evaluate_schedule_with_raw(
         pattern_df,
         assigned_count,
@@ -3155,6 +3167,17 @@ def run(input_path, output_dir=None, num_patterns=None):
         wd_spread = (max(wd_vals) - min(wd_vals)) if wd_vals else 0
         we_spread = (max(we_vals) - min(we_vals)) if we_vals else 0
 
+        # v6.12.0(提案#5): 二層累計公平 — 外病院累計（前月+今月）の均等化対象spread
+        # 単月は学年クォータで傾斜、年度の外病院累計は全員均等（方針③）。
+        # 恒常例外医師（CUM_FAIRNESS_EXEMPT）を除いたactive医師でmax-minを計算する。
+        ht_fair_vals = [prev_ht[d] + assigned_ht.get(d, 0)
+                        for d in active_doctors if d not in CUM_EXEMPT_SET]
+        ht_spread_fair = (max(ht_fair_vals) - min(ht_fair_vals)) if ht_fair_vals else 0
+
+        # v6.12.0(提案#9): ソフト回避医師の割当数（割当1回ごとに軽ペナルティ）
+        soft_avoid_assignments = sum(
+            assigned_count.get(d, 0) for d in doctor_names if d in SOFT_AVOID_SET)
+
         bk_ly_imbalance = 0
         for doc in active_doctors:
             if doc in RATIO_EXEMPT_DOCTORS:
@@ -3230,7 +3253,9 @@ def run(input_path, output_dir=None, num_patterns=None):
                 we_0_violations += 1
 
         # v6.10.0: 大学系暦週(日〜土)2回以上の違反 - ABS-012（ローリング7日→暦週）
+        # v6.12.0(提案#10): カテ番×平日大学一致（同じB-K走査に相乗り）
         weekly_bg_violations = 0
+        kate_weekday_matches = 0
         bg_dates_by_doc = {doc: [] for doc in doctor_names}  # doc -> [date list]
         for ridx in pattern_df.index:
             date = pattern_df.at[ridx, date_col_shift]
@@ -3253,6 +3278,11 @@ def run(input_path, output_dir=None, num_patterns=None):
                 # 固定割当の場合は許容（v6.2.0互換）
                 if is_preassigned_slot(ridx, hosp):
                     continue
+                # v6.12.0(提案#10): カテ当番日の平日大学枠(B/I-K)にカテ当番医師本人が
+                # 入っている数（できれば合わせる＝加点対象）
+                if (is_weekday_university_slot(hidx) and date.weekday() < 5
+                        and not is_holiday(date) and get_sched_code(date, doc)):
+                    kate_weekday_matches += 1
                 bg_dates_by_doc[doc].append(date)
         # 同一暦週(日曜始まり)に2回以上の違反をカウント
         for doc in active_doctors:
@@ -3310,6 +3340,11 @@ def run(input_path, output_dir=None, num_patterns=None):
         penalty += max(0, we_spread - 1) * W_WE_SPREAD
         penalty += bk_ly_imbalance * W_BK_LY_BALANCE
 
+        # v6.12.0: ソフト層3件（CP-SAT目的関数と同一項・提案#5/#9/#10）
+        penalty += max(0, ht_spread_fair - 1) * W_FAIR_CUM_HT  # 二層累計公平（外病院累計均等化）
+        penalty += soft_avoid_assignments * W_SOFT_AVOID       # ソフト回避医師の割当
+        penalty -= kate_weekday_matches * W_KATE_WEEKDAY_BONUS  # カテ番×平日大学一致は加点
+
         raw_score = 100 - penalty
         score = max(raw_score, 0)
 
@@ -3338,6 +3373,9 @@ def run(input_path, output_dir=None, num_patterns=None):
             "ht_spread_cum": float(ht_spread),
             "weekday_spread_cum": float(wd_spread),
             "weekend_spread_cum": float(we_spread),
+            "ht_spread_cum_fair": float(ht_spread_fair),  # v6.12.0: 外病院累計spread（均等化対象）
+            "soft_avoid_assignments": int(soft_avoid_assignments),  # v6.12.0: ソフト回避医師の割当数
+            "kate_weekday_matches": int(kate_weekday_matches),  # v6.12.0: カテ番×平日大学一致数
             "bk_ly_imbalance": int(bk_ly_imbalance),
         }
         return score, raw_score, metrics
@@ -3950,8 +3988,12 @@ def run(input_path, output_dir=None, num_patterns=None):
             {"項目": "累計全合計spread", "値": float(metrics.get("total_spread_cum", 0)), "説明": "累計全合計回数のmax-min（前月+今月、v6.5.9）"},
             {"項目": "大学系spread", "値": float(metrics.get("bg_spread_cum", 0)), "説明": "累計大学回数のmax-min（前月+今月）"},
             {"項目": "外病院spread", "値": float(metrics.get("ht_spread_cum", 0)), "説明": "累計外病院回数のmax-min"},
+            {"項目": "外病院累計spread", "値": float(metrics.get("ht_spread_cum_fair", 0)), "説明": "二層累計公平の対象spread（前月+今月の外病院、CUM_FAIRNESS_EXEMPT除外・重みW_FAIR_CUM_HT、v6.12.0）"},
             {"項目": "平日spread", "値": float(metrics.get("weekday_spread_cum", 0)), "説明": "累計平日回数のmax-min"},
             {"項目": "休日spread", "値": float(metrics.get("weekend_spread_cum", 0)), "説明": "累計休日回数のmax-min"},
+            {"項目": "--- ソフト層（v6.12.0） ---", "値": "", "説明": ""},
+            {"項目": "ソフト回避医師の割当数", "値": int(metrics.get("soft_avoid_assignments", 0)), "説明": "SOFT_AVOID_DOCTORS該当医師の割当合計（1回ごとW_SOFT_AVOIDの軽ペナルティ）"},
+            {"項目": "カテ番×平日大学一致", "値": int(metrics.get("kate_weekday_matches", 0)), "説明": "カテ当番日の平日大学枠(B/I-K)にカテ当番医師が入った数（W_KATE_WEEKDAY_BONUSで加点）"},
         ]
         return pd.DataFrame(rows)
 

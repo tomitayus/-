@@ -1,4 +1,4 @@
-# 当直くん 制約仕様書（v6.10.0時点）
+# 当直くん 制約仕様書（v6.12.0時点）
 
 > 本ドキュメントは制約ルールの完全な定義を提供します。
 > 実装コード（正本）:
@@ -73,6 +73,11 @@
 ### 1.4 パラメータ定義
 
 #### TARGET_CAP算出方法
+
+> **学年クォータ制（v6.10.0）**: Sheet3に「大学目標」「外目標」の両列がある入力では、以下の自動計算を
+> **全置換**して `TARGET_CAP[doc] = 大学目標 + 外目標`（CP-SATでは等式）・`UNIV_CAP[doc] = 大学目標` を直読みする
+> （EXTRA概念なし。ローテ者は月毎の目標入力で回数を変えられる）。両列が無い入力は従来どおり以下で自動計算。
+
 ```python
 BASE_TARGET = total_slots // len(active_doctors)
 EXTRA_SLOTS = total_slots - BASE_TARGET * len(active_doctors)
@@ -187,7 +192,7 @@ v6.0.0以降、旧「HARD」制約の実体は **ほぼ全てABS（絶対禁忌�
 | HARD-004 | CODE_2のn+1違反 | ABS-010（TARGET_CAPベース判定・SOFT `code_2_extra_violations` W=300でも計上） |
 
 > つまり運用上「ハード制約」という独立階層は事実上消滅している。B/I列・C-H/J-K列の「グループ1回まで」は
-> 現行では ABS-011（大学系2回まで）＋ ABS-012（大学系7日間隔）＋ evaluate側の `bg_over_2`/`bg_weekday_over` ペナルティで担保する。
+> 現行では ABS-011（大学系上限・クォータ時は大学目標）＋ ABS-012（大学系は暦週1回・v6.10.0）＋ evaluate側の `bg_over_2`/`bg_weekday_over` ペナルティで担保する。
 
 ### 2.3 準ハード制約（条件付き緩和可）
 
@@ -229,7 +234,7 @@ v6.0.0以降、旧「HARD」制約の実体は **ほぼ全てABS（絶対禁忌�
 | **300** | `code_2_extra_violations` | CODE_2医師のTARGET_CAP超過 | ハードコード | HARD-004→ABS-010 |
 | **300** | `bg_over_2_violations` | 大学系3回以上（CC除外）の超過分 | ハードコード | SOFT-002相当・大学3回以上 |
 | **300** | `ht_0_violations` | 外病院0回かつ大学≥1回 | ハードコード | SOFT-001相当・外病院0回 |
-| **300** | `weekly_bg_violations` | 大学系7日間隔違反（残留分） | ハードコード | ABS-012残留 |
+| **300** | `weekly_bg_violations` | 大学系の暦週(日〜土)2回以上違反（残留分・v6.10.0で暦週化） | ハードコード | ABS-012残留 |
 | **300** | `wd_we_imbalance_violations` | 平日/休日差≥2の超過分 | ハードコード | ABS-014残留 |
 | **300** | `we_0_violations` | 休日0回かつ総≥1回 | ハードコード | 休日0回（事実上ハード） |
 | **150** | `code_1_2_violations` | CODE_1.2医師が大学系0回 | ハードコード / `W_CODE_12_UNIV`(=150, greedy未使用) | 大学最低1回未達 |
@@ -238,6 +243,9 @@ v6.0.0以降、旧「HARD」制約の実体は **ほぼ全てABS（絶対禁忌�
 | **80** | `bg_weekday_over_violations` | 大学の平日2回以上の超過分 | ハードコード | 大学平日偏り |
 | **50** | `bg_weekday_weekend_imbalance` | 大学2回で平日1+休日1でない | ハードコード | 大学2回バランス |
 | **30** | `fairness_penalty` | 全合計公平性（active・CC除外、差≥2で2倍） | `W_FAIR_TOTAL` | 公平性 |
+| **20** | `ht_spread_cum_fair` | **二層累計公平（v6.12.0/提案#5・方針③）**: 外病院(L-Y)累計（前月+今月）のmax-min spread超過分。`CUM_FAIRNESS_EXEMPT` の恒常例外医師は対象外 | `W_FAIR_CUM_HT`(既定20・0で無効) | 年度の外病院累計は全員均等（単月は学年クォータで傾斜） |
+| **15** | `soft_avoid_assignments` | **ソフト回避（v6.12.0/提案#9）**: `SOFT_AVOID_DOCTORS` 該当医師の割当1回ごと | `W_SOFT_AVOID`(既定15) | 絶対禁忌ではない軽い回避 |
+| **-10** | `kate_weekday_matches` | **カテ番×平日大学一致（v6.12.0/提案#10）**: カテ当番日の平日大学枠(B/I-K)にカテ当番医師本人が入った数（**加点**＝penaltyから減算） | `W_KATE_WEEKDAY_BONUS`(既定10・0で無効) | できれば合わせる |
 | **2** | `bk_ly_imbalance` | B-K/L-Y比率の偏り合計（コード3除外） | `W_BK_LY_BALANCE` | 比率バランス |
 | **0** | `cum_total_spread` | 累計（前月+今月）全合計spread | `W_FAIR_CUM`(既定0) | 累計公平性（>0で有効化・表示のみ） |
 | **0** | `gap_violations` | gap<3日 | `W_GAP` | ABS-007で強制済み |
@@ -265,7 +273,23 @@ W_UNASSIGNED   = getattr(_cfg, 'W_UNASSIGNED', 500)    # 未割当ペナルテ�
 W_CAP                = 0    # ABS-010で対応
 W_BG_SPREAD = W_HT_SPREAD = W_WD_SPREAD = W_WE_SPREAD = 0  # 削除（簡略化）
 W_BK_LY_BALANCE = getattr(_cfg, 'W_BK_LY_BALANCE', 2)  # B-K/L-Y比率バランス
+
+# v6.12.0: ソフト層3件（configに項目が無ければ従来動作＝重み0/空リスト）
+W_FAIR_CUM_HT        = getattr(_cfg, 'W_FAIR_CUM_HT', 0)         # 二層累計公平（config既定20）
+CUM_FAIRNESS_EXEMPT  = getattr(_cfg, 'CUM_FAIRNESS_EXEMPT', [])  # 均等化対象外（恒常例外医師）
+SOFT_AVOID_DOCTORS   = getattr(_cfg, 'SOFT_AVOID_DOCTORS', [])   # ソフト回避医師（最大6名想定）
+W_SOFT_AVOID         = getattr(_cfg, 'W_SOFT_AVOID', 15)         # 回避医師の割当1回ごと
+W_KATE_WEEKDAY_BONUS = getattr(_cfg, 'W_KATE_WEEKDAY_BONUS', 0)  # カテ番×平日大学の加点（config既定10）
 ```
+
+**二層累計公平の設計（v6.12.0・方針③）:**
+- **単月**は学年クォータ（Sheet3目標列）で学年傾斜を付け、**年度**は外病院(L-Y)累計を全員均等化する二層構造。
+- CP-SATは `over >= (累計max − 累計min) − 1` のIntVarに `W_FAIR_CUM_HT` を掛けて最小化、
+  Greedyは evaluate で `max(0, spread−1) × W_FAIR_CUM_HT` を加算（同一式）。
+- 累計 = Sheet3「外病院合計」（前月まで）+ 当月の外病院割当。`CUM_FAIRNESS_EXEMPT` の医師は計算から除外。
+- summaryシートの「外病院累計spread」行（均等化対象のspread）で毎月確認できる。
+- クォータ有効月は各医師の外病院回数が「外目標」で固定されるため本項は定数化する（無害）。
+  クォータ無し（BASE_TARGET運用）の月に大学/外病院の配分自由度を通して効く。
 
 ---
 
@@ -366,10 +390,10 @@ inactive_doctors = [d for d in doctor_names if is_always_unavailable(d)]
 
 | カテゴリ | ID範囲 | 説明 |
 |---------|--------|------|
-| **ABS** | ABS-001〜015（009/014含む・欠番なし） | 絶対禁忌（配置不可）。定義=`validate_absolute_constraints()` |
+| **ABS** | ABS-001〜016（009/014含む・欠番なし）＋ GAIKIN-EX / TEAM-001（v6.11.0） | 絶対禁忌（配置不可）。定義=`validate_absolute_constraints()` |
 | **HARD** | HARD-001〜004（レガシー） | 実体はABSへ吸収済み（§2.2） |
 | **SEMI** | SEMI-001 | 準ハード制約（緩和可）。SEMI-002はABS-013へ格上げ済 |
-| **SOFT** | 適用重みで規定（§2.4） | ID体系は3系統に分裂・重みは `evaluate_schedule_with_raw()` が正本 |
+| **SOFT** | 適用重みで規定（§2.4） | ID体系は3系統に分裂・重みは `evaluate_schedule_with_raw()` が正本。v6.12.0でソフト層3件（二層累計公平/ソフト回避/カテ番×平日大学加点）を追加 |
 
 ### 列インデックス対応表
 
@@ -421,6 +445,8 @@ inactive_doctors = [d for d in doctor_names if is_always_unavailable(d)]
 
 | 日付 | バージョン | 変更内容 |
 |------|-----------|---------|
+| 2026-07-22 | v6.12.0 | ソフト層3件を§2.4/重み定数一覧に追加: ①二層累計公平（`W_FAIR_CUM_HT`既定20・`CUM_FAIRNESS_EXEMPT`・外病院累計spread） ②ソフト回避（`SOFT_AVOID_DOCTORS`×`W_SOFT_AVOID`） ③カテ番×平日大学一致の加点（`W_KATE_WEEKDAY_BONUS`）。§1.4に学年クォータのTARGET_CAP置換注記、§5のID範囲をABS-016+GAIKIN-EX/TEAM-001に更新、ABS-012の古い「7日間隔」表記を暦週に同期 |
+| 2026-07-22 | v6.11.0 | 可否レイヤ3件を§2.1に追加: GAIKIN-EX（外勤前日+当日の自動不可＋例外ペア `GAIKIN_EXCEPTIONS`/`GAIKIN_HOSPITAL_GROUPS`）・TEAM-001（チーム枠種制約 `TEAM_SLOT_RESTRICTIONS`） |
 | 2026-07-22 | v6.10.0 | 作成者実運用ルールの反映（コア配分3件）: ①学年クォータ制（Sheet3「大学目標」「外目標」列の直読み・ABS-010/011を医師別目標に置換・Σ検算プリフライト） ②ABS-012をローリング7日→暦週(日曜始まり〜土曜)1回に変更（月初第1週の前月重複は手動確認の警告） ③ABS-016新設（日直=昼系C/E/G+支援日直Jは月1回まで）。CP-SAT/Greedy両エンジンに同一実装 |
 | 2026-07-22 | v6.9.0 | コード正本へ全面同期: §2.4 SOFTを `evaluate_schedule_with_raw()` の実適用重みで全面書き換え（3系統ID分裂を明記）、ABS-009/ABS-014を§2.1表に追加、§2.2 HARDをABS吸収済みとして整理、§6にCP-SAT/Greedy切替を追記、ヘッダのコード正本参照を更新（colab版はアーカイブ） |
 | 2026-02-12 | v6.5 | v6.x系の変更を反映: ABS-007/008/010のABS格上げ、ABS-011〜015追加、SEMI-002〜004削除（格上げ/統合）、重み定数をv6.0.0仕様に更新（GAP/CAP/外病院重複=0）、段階的制約緩和（relax_abs）、修正パイプライン更新、属性による緩和可否、safe_fixラッパー |

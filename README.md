@@ -73,6 +73,17 @@ cd Tochoku-kun && bash run.sh
 python3 prepare_next_month.py <当月の出力.xlsx> <当月の雛形.xlsx> --pattern 1 -o <翌月ドラフト.xlsx>
 ```
 
+### 併走検証（当直くん vs 完成版）
+
+当直くん出力と手作り完成版を突き合わせ、セル相違・医師別回数差・一致率を出す:
+
+```bash
+python3 compare_schedules.py <当直くん.xlsx> <完成版.xlsx> --label-a 当直くん --label-b 完成版 -o <突合.md>
+```
+
+> 完成版は `pattern_01` シート（A1=`日付`・列並びは雛形 sheet1 と同じ）にするだけで突合対象になる。
+> 月次の運用フロー・フォルダ構成の詳細は **`docs/HEISOU_GUIDE.md`**。
+
 ### config.py の編集
 
 必要に応じて `config.py` を更新してください。

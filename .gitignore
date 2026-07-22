@@ -37,13 +37,18 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# data/ 配下のCSV・Excelファイル（個人情報保護のため）
+# data/ 配下のCSV・Excel・突合レポート（実医師名を含むため・サブフォルダ含む）
 data/*.xlsx
 data/*.xls
 data/*.csv
+data/**/*.xlsx
+data/**/*.xls
+data/**/*.csv
+data/**/*.md
 data/output/
 !data/.gitkeep
 !data/output/.gitkeep
+!data/併走/.gitkeep
 !data/sample_staff.csv
 
 # Logs

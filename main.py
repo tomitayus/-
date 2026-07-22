@@ -339,7 +339,7 @@ from collections import Counter, defaultdict
 import random
 
 # バージョン定数
-VERSION = "6.8.0"
+VERSION = "6.9.0"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -6176,278 +6176,375 @@ def run(input_path, output_dir=None, num_patterns=None):
     print("  🚀 スケジュール生成")
     print("="*60)
 
+    # =========================
+    # ソルバーエンジン選択（v6.9.0: 既定CP-SAT・失敗時Greedyフォールバック）
+    # =========================
+    _engine = str(getattr(_cfg, "SOLVER", "cpsat")).strip().lower()
+    _use_greedy = (_engine != "cpsat")
+    refined = None
     score_rows = []
-    candidates = []  # TOP_KEEPだけ保持
 
-    for i in tqdm(range(1, NUM_PATTERNS + 1), desc="   パターン生成", ncols=60, disable=not TQDM_AVAILABLE):
+    if _engine == "cpsat":
+        print("\n🧩 ソルバーエンジン: CP-SAT（厳密解・既定 / config.SOLVER='cpsat'）")
+        try:
+            import solver_cpsat as _cpsat
 
-        (
-            pattern_df,
-            counts,
-            bg_counts,
-            ht_counts,
-            wd_counts,
-            we_counts,
-            bk_counts,
-            ly_counts,
-            bg_cat,
-        ) = build_schedule_pattern(seed=i)
-        score, raw_score, metrics = evaluate_schedule_with_raw(
-            pattern_df,
-            counts,
-            bg_counts,
-            ht_counts,
-            wd_counts,
-            we_counts,
-            bk_counts,
-            ly_counts,
-        )
+            _cp_data, _cp_solutions = _cpsat.solve(
+                input_path, n_solutions=3, min_diff=6, verbose=False)
 
-        score_rows.append({"seed": i, "score": score, "raw_score": raw_score, **metrics})
+            # 二重パース回避のためTARGET_CAP/EXTRAの一致を検証（要件5）
+            _cp_cap = {d: int(v) for d, v in _cp_data.target_cap.items()}
+            _main_cap = {d: int(TARGET_CAP.get(d, 0)) for d in TARGET_CAP}
+            assert _cp_cap == _main_cap, (
+                "TARGET_CAPがmain.pyとCP-SATで不一致 "
+                f"(main={_main_cap} / cpsat={_cp_cap})")
+            assert set(EXTRA_ALLOWED) == set(_cp_data.extra_allowed), (
+                "EXTRA_ALLOWEDがmain.pyとCP-SATで不一致 "
+                f"(main={sorted(EXTRA_ALLOWED)} / cpsat={sorted(_cp_data.extra_allowed)})")
 
-        # gap違反が0個のパターンのみ採用（完全なgap制約遵守）
-        gap_violations = metrics.get("gap_violations", 0)
-        if gap_violations == 0:
-            candidates.append({
-                "seed": i,
-                "score": score,
-                "raw_score": raw_score,
-                "metrics": metrics,
-                "pattern_df": pattern_df,
-            })
+            def _cpsat_to_pattern_df(_assign):
+                """CP-SATの割当(slot_index->doc)をmain.pyのshift_df同型gridへ転写。"""
+                _df = shift_df.copy()
+                for _c in hospital_cols:
+                    _df[_c] = _df[_c].astype(object)
+                _lookup = {}
+                for _si, _slot in enumerate(_cp_data.slots):
+                    _doc = _slot["doc"] if _slot["fixed"] else _assign.get(_si, "UNASSIGNED")
+                    _lookup[(pd.Timestamp(_slot["date"]).normalize(), _slot["hosp"])] = _doc
+                for _ridx in _df.index:
+                    _dt = _df.at[_ridx, date_col_shift]
+                    if pd.isna(_dt):
+                        continue
+                    _kd = pd.Timestamp(_dt).normalize()
+                    for _hosp in hospital_cols:
+                        _k = (_kd, _hosp)
+                        if _k in _lookup:
+                            _df.at[_ridx, _hosp] = _lookup[_k]
+                return _df
 
-    # gap違反0個の候補をスコア順にソート
-    candidates = sorted(candidates, key=lambda e: e["raw_score"], reverse=True)[:TOP_KEEP]
+            refined = []
+            score_rows = []
+            for _i, _sol in enumerate(_cp_solutions, 1):
+                _pdf = _cpsat_to_pattern_df(_sol["assign"])
+                # recompute_stats/evaluate はグローバル bg_cat 等に依存するため、
+                # greedy 経路（6496行付近）と同一のグローバル名へ代入してから評価する。
+                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(_pdf)
+                score, raw_score, metrics = evaluate_schedule_with_raw(
+                    _pdf, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts)
+                violations, is_valid = validate_absolute_constraints(_pdf, verbose=False)
+                refined.append({
+                    "seed": _i,
+                    "score_before": score,
+                    "raw_before": raw_score,
+                    "score_after": score,
+                    "raw_after": raw_score,
+                    "metrics_after": metrics,
+                    "pattern_df": _pdf,
+                    "violations_fixed": 0,
+                    "violations_failed": 0,
+                    "code_2_violations_fixed": 0,
+                    "cap_violations_fixed": 0,
+                    "univ_min_violations_fixed": 0,
+                    "ch_kate_violations_fixed": 0,
+                    "bg_ht_imbalance_fixed": 0,
+                    "gap_violations_fixed": 0,
+                    "external_dup_violations_fixed": 0,
+                    "univ_over_2_violations_fixed": 0,
+                    "univ_weekday_violations_fixed": 0,
+                    "fairness_violations_fixed": 0,
+                    "unassigned_slots_fixed": 0,
+                    "absolute_constraints_valid": is_valid,
+                    "absolute_violations": violations,
+                })
+                score_rows.append({"seed": _i, "score": score, "raw_score": raw_score, **metrics})
+                print(f"   pattern_{_i:02d}: {_sol['status']} "
+                      f"SEMI違反={_sol['semi']} 公平span={_sol['fair_span']} "
+                      f"ABS={'OK' if is_valid else 'NG'} ({_sol['time']:.2f}秒)")
+            print(f"   ✅ CP-SATで{len(refined)}パターン生成（全制約厳密解）")
+            _use_greedy = False
+        except ImportError as _ex:
+            print(f"   ⚠️ ortools未導入のためGreedyエンジンへフォールバック: {_ex}")
+            refined = None
+            _use_greedy = True
+        except Exception as _ex:
+            print(f"   ⚠️ CP-SAT失敗（{type(_ex).__name__}: {_ex}）→ Greedyエンジンへフォールバック")
+            refined = None
+            _use_greedy = True
 
-    if len(candidates) == 0:
-        print("\n⚠️  gap違反0個の候補なし → 制約緩和して続行")
-        # gap違反の制約を緩和して再選択
-        candidates = []
-        for row in score_rows:
-            candidates.append({
-                "seed": row["seed"],
-                "score": row["score"],
-                "raw_score": row["raw_score"],
-                "metrics": {k: v for k, v in row.items() if k not in ["seed", "score", "raw_score"]},
-                "pattern_df": None,  # 再生成が必要
-            })
+    if _use_greedy:
+        print("\n🧩 ソルバーエンジン: Greedy + fix パイプライン（config.SOLVER='greedy' またはフォールバック）")
+        score_rows = []
+        candidates = []  # TOP_KEEPだけ保持
+
+        for i in tqdm(range(1, NUM_PATTERNS + 1), desc="   パターン生成", ncols=60, disable=not TQDM_AVAILABLE):
+
+            (
+                pattern_df,
+                counts,
+                bg_counts,
+                ht_counts,
+                wd_counts,
+                we_counts,
+                bk_counts,
+                ly_counts,
+                bg_cat,
+            ) = build_schedule_pattern(seed=i)
+            score, raw_score, metrics = evaluate_schedule_with_raw(
+                pattern_df,
+                counts,
+                bg_counts,
+                ht_counts,
+                wd_counts,
+                we_counts,
+                bk_counts,
+                ly_counts,
+            )
+
+            score_rows.append({"seed": i, "score": score, "raw_score": raw_score, **metrics})
+
+            # gap違反が0個のパターンのみ採用（完全なgap制約遵守）
+            gap_violations = metrics.get("gap_violations", 0)
+            if gap_violations == 0:
+                candidates.append({
+                    "seed": i,
+                    "score": score,
+                    "raw_score": raw_score,
+                    "metrics": metrics,
+                    "pattern_df": pattern_df,
+                })
+
+        # gap違反0個の候補をスコア順にソート
         candidates = sorted(candidates, key=lambda e: e["raw_score"], reverse=True)[:TOP_KEEP]
-        # パターンを再生成
-        for cand in candidates:
-            if cand["pattern_df"] is None:
-                pattern_df, *_ = build_schedule_pattern(seed=cand["seed"])
-                cand["pattern_df"] = pattern_df
 
-    # ローカル探索で候補を改善
-    refined = []
-    refine_list = candidates[:REFINE_TOP]
-    for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=60, disable=not TQDM_AVAILABLE), 1):
-        if LOCAL_SEARCH_ENABLED:
-            improved_df, sc2, raw2, met2 = local_search_swap(
-                cand["pattern_df"],
-                max_iters=LOCAL_MAX_ITERS,
-                patience=LOCAL_PATIENCE,
-                refresh_every=LOCAL_REFRESH_EVERY,
-                seed=1000 + cand["seed"],
-            )
-        else:
-            improved_df = cand["pattern_df"]
-            sc2 = cand["score"]
-            raw2 = cand["raw_score"]
-            met2 = cand["metrics"]
+        if len(candidates) == 0:
+            print("\n⚠️  gap違反0個の候補なし → 制約緩和して続行")
+            # gap違反の制約を緩和して再選択
+            candidates = []
+            for row in score_rows:
+                candidates.append({
+                    "seed": row["seed"],
+                    "score": row["score"],
+                    "raw_score": row["raw_score"],
+                    "metrics": {k: v for k, v in row.items() if k not in ["seed", "score", "raw_score"]},
+                    "pattern_df": None,  # 再生成が必要
+                })
+            candidates = sorted(candidates, key=lambda e: e["raw_score"], reverse=True)[:TOP_KEEP]
+            # パターンを再生成
+            for cand in candidates:
+                if cand["pattern_df"] is None:
+                    pattern_df, *_ = build_schedule_pattern(seed=cand["seed"])
+                    cand["pattern_df"] = pattern_df
 
-        # v6.0.3: safe_fixラッパー + 収束ループで最適化
-        # 各fix関数をsafe_fixで実行。ABS違反が増えたらrevertされる。
-        # 収束するまで最大3ラウンド繰り返す。
-        if OPTIMIZATION_ENABLED:
-            current_df = improved_df
-            total_fix_counts = {}
-            MAX_ROUNDS = 3
-
-            for opt_round in range(MAX_ROUNDS):
-                round_fixed = 0
-
-                # 1. ハード制約違反の自動修正
-                result = safe_fix(fix_hard_constraint_violations, current_df, max_attempts=50)
-                current_df, _, fc = result[0], result[1], result[2]
-                fail_count = result[3] if len(result) > 3 else 0
-                total_fix_counts["hard"] = total_fix_counts.get("hard", 0) + fc
-                round_fixed += fc
-
-                # 2. 可否コード2医師のn+1回違反を修正
-                current_df, _, fc = safe_fix(fix_code_2_extra_violations, current_df, max_attempts=100)
-                total_fix_counts["code2"] = total_fix_counts.get("code2", 0) + fc
-                round_fixed += fc
-
-                # 3. TARGET_CAP違反の自動修正
-                current_df, _, fc = safe_fix(fix_target_cap_violations, current_df, max_attempts=100)
-                total_fix_counts["cap"] = total_fix_counts.get("cap", 0) + fc
-                round_fixed += fc
-
-                # 4. 大学系最低1回必須違反を修正
-                current_df, _, fc = safe_fix(fix_university_minimum_requirement, current_df, max_attempts=100)
-                total_fix_counts["univ_min"] = total_fix_counts.get("univ_min", 0) + fc
-                round_fixed += fc
-
-                # 5. C-H列カテ当番違反を修正
-                current_df, _, fc = safe_fix(fix_ch_kate_violations, current_df, max_attempts=100)
-                total_fix_counts["ch_kate"] = total_fix_counts.get("ch_kate", 0) + fc
-                round_fixed += fc
-
-                # 6. gap違反を修正
-                current_df, _, fc = safe_fix(fix_gap_violations, current_df, max_attempts=200)
-                total_fix_counts["gap"] = total_fix_counts.get("gap", 0) + fc
-                round_fixed += fc
-
-                # 7. 大学系/外病院バランス修正
-                current_df, _, fc = safe_fix(fix_bg_ht_imbalance_violations, current_df, max_attempts=100)
-                total_fix_counts["bg_ht"] = total_fix_counts.get("bg_ht", 0) + fc
-                round_fixed += fc
-
-                # 8. 外病院重複を修正
-                current_df, _, fc = safe_fix(fix_external_hospital_dup_violations, current_df, max_attempts=150)
-                total_fix_counts["ext_dup"] = total_fix_counts.get("ext_dup", 0) + fc
-                round_fixed += fc
-
-                # 9. 大学3回以上違反を修正
-                current_df, _, fc = safe_fix(fix_university_over_2_violations, current_df, max_attempts=150)
-                total_fix_counts["univ_over2"] = total_fix_counts.get("univ_over2", 0) + fc
-                round_fixed += fc
-
-                # 10. v6.4.0: 大学系週1違反を修正（ABS-012）
-                current_df, _, fc = safe_fix(fix_weekly_bg_violations, current_df, max_attempts=150)
-                total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + fc
-                round_fixed += fc
-
-                # 11. 大学平日偏り違反を修正
-                current_df, _, fc = safe_fix(fix_university_weekday_balance_violations, current_df, max_attempts=150)
-                total_fix_counts["univ_wd"] = total_fix_counts.get("univ_wd", 0) + fc
-                round_fixed += fc
-
-                # 11.5 全体の平日/休日偏り違反を修正
-                current_df, _, fc = safe_fix(fix_weekday_weekend_balance, current_df, max_attempts=200)
-                total_fix_counts["wd_we"] = total_fix_counts.get("wd_we", 0) + fc
-                round_fixed += fc
-
-                # 12. 公平性違反の修正
-                current_df, _, fc = safe_fix(fix_fairness_imbalance, current_df, max_attempts=200)
-                total_fix_counts["fairness"] = total_fix_counts.get("fairness", 0) + fc
-                round_fixed += fc
-
-                # 13. 未割り当てスロットを埋める（セーフティネット）
-                current_df, _, fc = safe_fix(fix_unassigned_slots, current_df)
-                total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + fc
-                round_fixed += fc
-
-                # 14. 大学系週1違反の再修正（ステップ11-13で再発した違反をキャッチ）
-                current_df, _, fc = safe_fix(fix_weekly_bg_violations, current_df, max_attempts=150)
-                total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + fc
-                round_fixed += fc
-
-                # 収束チェック: 修正がなければループ終了
-                if round_fixed == 0:
-                    break
-
-            # ── 収束ループ後の最終パス ──
-            # safe_fixがrevertしたABS違反を最終的に解消する
-            # ABS制約の優先度: gap/病院重複を先に修正 → 未割当を最後に埋める
-            # safe_fixを通さず直接実行（ABS違反同士のトレードオフを許容）
-
-            # 1) gap違反を修正（safe_fix不使用: 移動先が見つからず削除→未割当になっても許容）
-            final_df, _, final_gap_fc = fix_gap_violations(current_df, max_attempts=200, verbose=False)
-            total_fix_counts["gap"] = total_fix_counts.get("gap", 0) + final_gap_fc
-
-            # 2) 外病院重複を修正
-            final_df, _, final_dup_fc = fix_external_hospital_dup_violations(final_df, max_attempts=150, verbose=False)
-            total_fix_counts["ext_dup"] = total_fix_counts.get("ext_dup", 0) + final_dup_fc
-
-            # 2.5) 大学系週1違反を修正（gap/dup修正で発生した違反を含む）
-            final_df, _, final_weekly_bg_fc = fix_weekly_bg_violations(final_df, max_attempts=150, verbose=False)
-            total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + final_weekly_bg_fc
-
-            # 2.7) TARGET_CAP違反を修正（safe_fixでrevertされた分を含む）
-            final_df, _, final_cap_fc = fix_target_cap_violations(final_df, max_attempts=100, verbose=False)
-            total_fix_counts["cap"] = total_fix_counts.get("cap", 0) + final_cap_fc
-
-            # 2.8) 平日/休日偏り違反を修正
-            final_df, _, final_wd_we_fc = fix_weekday_weekend_balance(final_df, max_attempts=200, verbose=False)
-            total_fix_counts["wd_we"] = total_fix_counts.get("wd_we", 0) + final_wd_we_fc
-
-            # 3) 未割当スロットを埋める（gap/dup修正で発生した未割当を含む）
-            final_df, _, final_unassigned_fc = fix_unassigned_slots(final_df, verbose=False)
-            total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + final_unassigned_fc
-
-            # 4) 大学系週1違反の最終修正（未割当埋めで発生した違反をキャッチ）
-            final_df, _, final_weekly_bg_fc2 = fix_weekly_bg_violations(final_df, max_attempts=150, verbose=False)
-            total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + final_weekly_bg_fc2
-
-            fix_count = total_fix_counts.get("hard", 0)
-            code_2_fix_count = total_fix_counts.get("code2", 0)
-            cap_fix_count = total_fix_counts.get("cap", 0)
-            univ_min_fix_count = total_fix_counts.get("univ_min", 0)
-            ch_kate_fix_count = total_fix_counts.get("ch_kate", 0)
-            gap_fix_count = total_fix_counts.get("gap", 0)
-            bg_ht_fix_count = total_fix_counts.get("bg_ht", 0)
-            ext_dup_fix_count = total_fix_counts.get("ext_dup", 0)
-            univ_over_2_fix_count = total_fix_counts.get("univ_over2", 0)
-            univ_weekday_fix_count = total_fix_counts.get("univ_wd", 0)
-            fairness_fix_count = total_fix_counts.get("fairness", 0)
-            unassigned_fix_count = total_fix_counts.get("unassigned", 0)
-
-            # 修正後に再評価
-            any_fixed = sum(total_fix_counts.values()) > 0
-            if any_fixed:
-                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(final_df)
-                sc2, raw2, met2 = evaluate_schedule_with_raw(
-                    final_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+        # ローカル探索で候補を改善
+        refined = []
+        refine_list = candidates[:REFINE_TOP]
+        for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=60, disable=not TQDM_AVAILABLE), 1):
+            if LOCAL_SEARCH_ENABLED:
+                improved_df, sc2, raw2, met2 = local_search_swap(
+                    cand["pattern_df"],
+                    max_iters=LOCAL_MAX_ITERS,
+                    patience=LOCAL_PATIENCE,
+                    refresh_every=LOCAL_REFRESH_EVERY,
+                    seed=1000 + cand["seed"],
                 )
-                improved_df = final_df
             else:
-                improved_df = final_df
-        else:
-            # 最適化無効時: fix_unassigned_slots のみ実行
-            fix_count = fail_count = 0
-            code_2_fix_count = cap_fix_count = univ_min_fix_count = 0
-            ch_kate_fix_count = gap_fix_count = bg_ht_fix_count = 0
-            ext_dup_fix_count = univ_over_2_fix_count = univ_weekday_fix_count = 0
-            fairness_fix_count = 0
+                improved_df = cand["pattern_df"]
+                sc2 = cand["score"]
+                raw2 = cand["raw_score"]
+                met2 = cand["metrics"]
 
-            final_df, unassigned_success, unassigned_fix_count = fix_unassigned_slots(
-                improved_df, verbose=False
-            )
-            if unassigned_fix_count > 0:
-                counts_tmp, bg_tmp, ht_tmp, wd_tmp, we_tmp, bk_tmp, ly_tmp, bg_cat_tmp, *_ = recompute_stats(final_df)
-                sc2, raw2, met2 = evaluate_schedule_with_raw(
-                    final_df, counts_tmp, bg_tmp, ht_tmp, wd_tmp, we_tmp, bk_tmp, ly_tmp
+            # v6.0.3: safe_fixラッパー + 収束ループで最適化
+            # 各fix関数をsafe_fixで実行。ABS違反が増えたらrevertされる。
+            # 収束するまで最大3ラウンド繰り返す。
+            if OPTIMIZATION_ENABLED:
+                current_df = improved_df
+                total_fix_counts = {}
+                MAX_ROUNDS = 3
+
+                for opt_round in range(MAX_ROUNDS):
+                    round_fixed = 0
+
+                    # 1. ハード制約違反の自動修正
+                    result = safe_fix(fix_hard_constraint_violations, current_df, max_attempts=50)
+                    current_df, _, fc = result[0], result[1], result[2]
+                    fail_count = result[3] if len(result) > 3 else 0
+                    total_fix_counts["hard"] = total_fix_counts.get("hard", 0) + fc
+                    round_fixed += fc
+
+                    # 2. 可否コード2医師のn+1回違反を修正
+                    current_df, _, fc = safe_fix(fix_code_2_extra_violations, current_df, max_attempts=100)
+                    total_fix_counts["code2"] = total_fix_counts.get("code2", 0) + fc
+                    round_fixed += fc
+
+                    # 3. TARGET_CAP違反の自動修正
+                    current_df, _, fc = safe_fix(fix_target_cap_violations, current_df, max_attempts=100)
+                    total_fix_counts["cap"] = total_fix_counts.get("cap", 0) + fc
+                    round_fixed += fc
+
+                    # 4. 大学系最低1回必須違反を修正
+                    current_df, _, fc = safe_fix(fix_university_minimum_requirement, current_df, max_attempts=100)
+                    total_fix_counts["univ_min"] = total_fix_counts.get("univ_min", 0) + fc
+                    round_fixed += fc
+
+                    # 5. C-H列カテ当番違反を修正
+                    current_df, _, fc = safe_fix(fix_ch_kate_violations, current_df, max_attempts=100)
+                    total_fix_counts["ch_kate"] = total_fix_counts.get("ch_kate", 0) + fc
+                    round_fixed += fc
+
+                    # 6. gap違反を修正
+                    current_df, _, fc = safe_fix(fix_gap_violations, current_df, max_attempts=200)
+                    total_fix_counts["gap"] = total_fix_counts.get("gap", 0) + fc
+                    round_fixed += fc
+
+                    # 7. 大学系/外病院バランス修正
+                    current_df, _, fc = safe_fix(fix_bg_ht_imbalance_violations, current_df, max_attempts=100)
+                    total_fix_counts["bg_ht"] = total_fix_counts.get("bg_ht", 0) + fc
+                    round_fixed += fc
+
+                    # 8. 外病院重複を修正
+                    current_df, _, fc = safe_fix(fix_external_hospital_dup_violations, current_df, max_attempts=150)
+                    total_fix_counts["ext_dup"] = total_fix_counts.get("ext_dup", 0) + fc
+                    round_fixed += fc
+
+                    # 9. 大学3回以上違反を修正
+                    current_df, _, fc = safe_fix(fix_university_over_2_violations, current_df, max_attempts=150)
+                    total_fix_counts["univ_over2"] = total_fix_counts.get("univ_over2", 0) + fc
+                    round_fixed += fc
+
+                    # 10. v6.4.0: 大学系週1違反を修正（ABS-012）
+                    current_df, _, fc = safe_fix(fix_weekly_bg_violations, current_df, max_attempts=150)
+                    total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + fc
+                    round_fixed += fc
+
+                    # 11. 大学平日偏り違反を修正
+                    current_df, _, fc = safe_fix(fix_university_weekday_balance_violations, current_df, max_attempts=150)
+                    total_fix_counts["univ_wd"] = total_fix_counts.get("univ_wd", 0) + fc
+                    round_fixed += fc
+
+                    # 11.5 全体の平日/休日偏り違反を修正
+                    current_df, _, fc = safe_fix(fix_weekday_weekend_balance, current_df, max_attempts=200)
+                    total_fix_counts["wd_we"] = total_fix_counts.get("wd_we", 0) + fc
+                    round_fixed += fc
+
+                    # 12. 公平性違反の修正
+                    current_df, _, fc = safe_fix(fix_fairness_imbalance, current_df, max_attempts=200)
+                    total_fix_counts["fairness"] = total_fix_counts.get("fairness", 0) + fc
+                    round_fixed += fc
+
+                    # 13. 未割り当てスロットを埋める（セーフティネット）
+                    current_df, _, fc = safe_fix(fix_unassigned_slots, current_df)
+                    total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + fc
+                    round_fixed += fc
+
+                    # 14. 大学系週1違反の再修正（ステップ11-13で再発した違反をキャッチ）
+                    current_df, _, fc = safe_fix(fix_weekly_bg_violations, current_df, max_attempts=150)
+                    total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + fc
+                    round_fixed += fc
+
+                    # 収束チェック: 修正がなければループ終了
+                    if round_fixed == 0:
+                        break
+
+                # ── 収束ループ後の最終パス ──
+                # safe_fixがrevertしたABS違反を最終的に解消する
+                # ABS制約の優先度: gap/病院重複を先に修正 → 未割当を最後に埋める
+                # safe_fixを通さず直接実行（ABS違反同士のトレードオフを許容）
+
+                # 1) gap違反を修正（safe_fix不使用: 移動先が見つからず削除→未割当になっても許容）
+                final_df, _, final_gap_fc = fix_gap_violations(current_df, max_attempts=200, verbose=False)
+                total_fix_counts["gap"] = total_fix_counts.get("gap", 0) + final_gap_fc
+
+                # 2) 外病院重複を修正
+                final_df, _, final_dup_fc = fix_external_hospital_dup_violations(final_df, max_attempts=150, verbose=False)
+                total_fix_counts["ext_dup"] = total_fix_counts.get("ext_dup", 0) + final_dup_fc
+
+                # 2.5) 大学系週1違反を修正（gap/dup修正で発生した違反を含む）
+                final_df, _, final_weekly_bg_fc = fix_weekly_bg_violations(final_df, max_attempts=150, verbose=False)
+                total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + final_weekly_bg_fc
+
+                # 2.7) TARGET_CAP違反を修正（safe_fixでrevertされた分を含む）
+                final_df, _, final_cap_fc = fix_target_cap_violations(final_df, max_attempts=100, verbose=False)
+                total_fix_counts["cap"] = total_fix_counts.get("cap", 0) + final_cap_fc
+
+                # 2.8) 平日/休日偏り違反を修正
+                final_df, _, final_wd_we_fc = fix_weekday_weekend_balance(final_df, max_attempts=200, verbose=False)
+                total_fix_counts["wd_we"] = total_fix_counts.get("wd_we", 0) + final_wd_we_fc
+
+                # 3) 未割当スロットを埋める（gap/dup修正で発生した未割当を含む）
+                final_df, _, final_unassigned_fc = fix_unassigned_slots(final_df, verbose=False)
+                total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + final_unassigned_fc
+
+                # 4) 大学系週1違反の最終修正（未割当埋めで発生した違反をキャッチ）
+                final_df, _, final_weekly_bg_fc2 = fix_weekly_bg_violations(final_df, max_attempts=150, verbose=False)
+                total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + final_weekly_bg_fc2
+
+                fix_count = total_fix_counts.get("hard", 0)
+                code_2_fix_count = total_fix_counts.get("code2", 0)
+                cap_fix_count = total_fix_counts.get("cap", 0)
+                univ_min_fix_count = total_fix_counts.get("univ_min", 0)
+                ch_kate_fix_count = total_fix_counts.get("ch_kate", 0)
+                gap_fix_count = total_fix_counts.get("gap", 0)
+                bg_ht_fix_count = total_fix_counts.get("bg_ht", 0)
+                ext_dup_fix_count = total_fix_counts.get("ext_dup", 0)
+                univ_over_2_fix_count = total_fix_counts.get("univ_over2", 0)
+                univ_weekday_fix_count = total_fix_counts.get("univ_wd", 0)
+                fairness_fix_count = total_fix_counts.get("fairness", 0)
+                unassigned_fix_count = total_fix_counts.get("unassigned", 0)
+
+                # 修正後に再評価
+                any_fixed = sum(total_fix_counts.values()) > 0
+                if any_fixed:
+                    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(final_df)
+                    sc2, raw2, met2 = evaluate_schedule_with_raw(
+                        final_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+                    )
+                    improved_df = final_df
+                else:
+                    improved_df = final_df
+            else:
+                # 最適化無効時: fix_unassigned_slots のみ実行
+                fix_count = fail_count = 0
+                code_2_fix_count = cap_fix_count = univ_min_fix_count = 0
+                ch_kate_fix_count = gap_fix_count = bg_ht_fix_count = 0
+                ext_dup_fix_count = univ_over_2_fix_count = univ_weekday_fix_count = 0
+                fairness_fix_count = 0
+
+                final_df, unassigned_success, unassigned_fix_count = fix_unassigned_slots(
+                    improved_df, verbose=False
                 )
+                if unassigned_fix_count > 0:
+                    counts_tmp, bg_tmp, ht_tmp, wd_tmp, we_tmp, bk_tmp, ly_tmp, bg_cat_tmp, *_ = recompute_stats(final_df)
+                    sc2, raw2, met2 = evaluate_schedule_with_raw(
+                        final_df, counts_tmp, bg_tmp, ht_tmp, wd_tmp, we_tmp, bk_tmp, ly_tmp
+                    )
 
-        # v5.7.1: 絶対禁忌の最終検証
-        violations, is_valid = validate_absolute_constraints(final_df, verbose=False)
+            # v5.7.1: 絶対禁忌の最終検証
+            violations, is_valid = validate_absolute_constraints(final_df, verbose=False)
 
-        refined.append({
-            "seed": cand["seed"],
-            "score_before": cand["score"],
-            "raw_before": cand["raw_score"],
-            "score_after": sc2,
-            "raw_after": raw2,
-            "metrics_after": met2,
-            "pattern_df": final_df,  # v5.7.1: 最終パターンを使用
-            "violations_fixed": fix_count,
-            "violations_failed": fail_count,
-            "code_2_violations_fixed": code_2_fix_count,
-            "cap_violations_fixed": cap_fix_count,
-            "univ_min_violations_fixed": univ_min_fix_count,
-            "ch_kate_violations_fixed": ch_kate_fix_count,
-            "bg_ht_imbalance_fixed": bg_ht_fix_count,
-            "gap_violations_fixed": gap_fix_count,
-            "external_dup_violations_fixed": ext_dup_fix_count,
-            "univ_over_2_violations_fixed": univ_over_2_fix_count,
-            "univ_weekday_violations_fixed": univ_weekday_fix_count,
-            "fairness_violations_fixed": fairness_fix_count,
-            "unassigned_slots_fixed": unassigned_fix_count,
-            "absolute_constraints_valid": is_valid,  # v5.7.1: 絶対禁忌チェック結果
-            "absolute_violations": violations,  # v5.7.1: 違反詳細
-        })
+            refined.append({
+                "seed": cand["seed"],
+                "score_before": cand["score"],
+                "raw_before": cand["raw_score"],
+                "score_after": sc2,
+                "raw_after": raw2,
+                "metrics_after": met2,
+                "pattern_df": final_df,  # v5.7.1: 最終パターンを使用
+                "violations_fixed": fix_count,
+                "violations_failed": fail_count,
+                "code_2_violations_fixed": code_2_fix_count,
+                "cap_violations_fixed": cap_fix_count,
+                "univ_min_violations_fixed": univ_min_fix_count,
+                "ch_kate_violations_fixed": ch_kate_fix_count,
+                "bg_ht_imbalance_fixed": bg_ht_fix_count,
+                "gap_violations_fixed": gap_fix_count,
+                "external_dup_violations_fixed": ext_dup_fix_count,
+                "univ_over_2_violations_fixed": univ_over_2_fix_count,
+                "univ_weekday_violations_fixed": univ_weekday_fix_count,
+                "fairness_violations_fixed": fairness_fix_count,
+                "unassigned_slots_fixed": unassigned_fix_count,
+                "absolute_constraints_valid": is_valid,  # v5.7.1: 絶対禁忌チェック結果
+                "absolute_violations": violations,  # v5.7.1: 違反詳細
+            })
 
     # =========================
     # v5.7.1: 絶対禁忌チェック結果の表示

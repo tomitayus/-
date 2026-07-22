@@ -833,6 +833,40 @@ class CpSatScheduler:
 
 
 # =========================
+# ライブラリAPI（main.py 本統合用・v6.9.0）
+# =========================
+def solve(input_data, n_solutions=3, min_diff=6, time_limit=60, verbose=False):
+    """入力Excelをパースしてn個のCP-SAT厳密解を返すライブラリ関数。
+
+    CLI（main()）とは独立に main.py から import して利用する本統合用の公開API。
+
+    Args:
+        input_data: 入力Excelのパス（str）。既存 InputData でパースする。
+        n_solutions: 生成する解の数（既定3）。
+        min_diff: 解間の最小Hamming距離（枠単位・既定6）。
+        time_limit: 1解あたりの求解秒数上限（既定60）。
+        verbose: InputDataパースのログ出力可否。
+
+    Returns:
+        (data, solutions):
+            data      … InputData（TARGET_CAP・EXTRA等の突合に利用可）
+            solutions … list[dict]。各要素は solve_multi の戻り
+                        （assign=slot_index->doc, status, objective, semi,
+                          fair_span, time）。
+
+    Raises:
+        ImportError   … ortools未導入（モジュールimport時点で送出されうる）
+        RuntimeError  … INFEASIBLE等で1解も得られない場合
+        その他例外    … パース失敗等。呼び出し側でフォールバック判定に用いる。
+    """
+    data = InputData(input_data, verbose=verbose)
+    sched = CpSatScheduler(data)
+    solutions = sched.solve_multi(
+        n_solutions=n_solutions, time_limit=time_limit, min_diff=min_diff)
+    return data, solutions
+
+
+# =========================
 # 出力Excel生成
 # =========================
 def build_pattern_df(data: InputData, assign):

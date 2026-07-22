@@ -1,8 +1,28 @@
 # 当直くん - バージョン履歴
 
-## v6.9.0向け（未リリース・VERSION据え置き6.8.0） - 実行前プリフライト検証 + 氏名突合厳格化
+## v6.9.0 (2026-07-22) - CP-SAT本統合（既定エンジン化）+ 実行前プリフライト検証 + 氏名突合厳格化
 
-> 版番号は次のCP-SAT統合でまとめて6.9.0に上げる予定。現時点では VERSION 定数は 6.8.0 のまま。
+> VERSION 定数を 6.9.0 に更新。既定ソルバーを CP-SAT（厳密解）に切り替え、
+> 旧 Greedy+fix パイプラインは併走検証用フォールバックとして残す（1〜2ヶ月の検証後に整理予定・
+> **Greedy/fix群のコードは削除しない**）。
+
+### CP-SAT本統合（中期#2 Phase 2）
+- **ライブラリ化**: `solver_cpsat.solve(input_data, n_solutions=3, min_diff=6, time_limit=60, verbose=False)`
+  を公開。`(data, solutions)` を返す（`data`=InputData、`solutions`=各解の `assign`/status/semi/fair_span/time）。
+  CLI（`python3 solver_cpsat.py …`）は従来どおり維持。
+- **config.SOLVER 新設**: `"cpsat"`（既定・厳密解）/ `"greedy"`（旧エンジン）。
+- **main.run() の分岐**: cpsat選択時は CP-SAT で3解生成 → 各解を main.py の shift_df 同型グリッド
+  （`pattern_df`）へ転写 → **既存の evaluate/summary/バナー/Excel出力パイプラインへ合流**。
+  出力ファイル名（`<入力名>_v6.9.0.xlsx`）・シート構成（pattern_XX / pattern_XX_summary）は従来と同一。
+  使用エンジンは stdout に明示（`🧩 ソルバーエンジン: …`）。
+- **二重パース回避の整合性検証（要件5）**: CP-SAT側 `InputData` の `TARGET_CAP`/`EXTRA_ALLOWED` が
+  main.py のグローバルと**完全一致することを assert**（不一致時はフォールバック）。
+- **自動フォールバック**: ortools未導入（ImportError）/ INFEASIBLE / 例外 / 整合性assert失敗のいずれでも
+  警告を出して Greedy エンジンへ自動切替（明示メッセージ）。
+- **不変の運用ルール維持**: EXTRA(+1回)対象は属性1優先→名簿末尾（五十嵐・猪股）で従来と一致。
+- **実測**: 雛形（32医師・98枠）で3解を約1秒で生成、全パターン緑バナー・全制約違反ゼロ。
+- **テスト**: 既存の不変条件テスト（`tests/test_invariants.py` ほか計87件）は cpsat 既定のまま全緑。
+  cpsat は `num_patterns` を無視して常に3解生成するため、セッションフィクスチャの実行時間も短縮。
 
 ### 氏名突合の厳格化（sheet4前月累積との照合）
 - **完全一致のみに変更**: 旧実装の「片側strip×双方向startswith」を撤去。

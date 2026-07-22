@@ -736,6 +736,164 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
+# 列役割アンカーの名前解決（v6.10.0 / 中期#5）
+# 位置固定（*_COL_INDEX=定数 + min()クランプ）は、テンプレの列追加/削除/並べ替えで
+# 全制約が誤った列へ無言で束縛される。ヘッダ名から役割を解決し、標準位置と照合する。
+# =========================
+
+# 役割 → 標準位置（0始まり, B〜Y）。ヘッダ名から解決できない場合のフォールバック。
+_STANDARD_COL_ANCHORS = {
+    "B": 1, "C": 2, "D": 3, "E": 4, "F": 5, "G": 6, "H": 7,
+    "I": 8, "J": 9, "K": 10, "L": 11, "M": 12, "Q": 16, "U": 20, "Y": 24,
+}
+
+# 大学系開始(B)・休日大学範囲(C〜H)・支援平日範囲(I〜K)のヘッダ名パターン（全語を含む列）
+_ANCHOR_NAME_RULES = {
+    "B": ("大学", "平日"),        # 大学系開始
+    "C": ("大学", "土曜", "昼"),  # 休日大学範囲: 土曜昼
+    "D": ("大学", "土曜", "夜"),  #             土曜夜
+    "E": ("大学", "日曜", "昼"),  #             日曜昼
+    "F": ("大学", "日曜", "夜"),  #             日曜夜
+    "G": ("大学", "祝日", "昼"),  #             祝日昼
+    "H": ("大学", "祝日", "夜"),  #             祝日夜
+    "I": ("支援", "平日"),        # 支援平日範囲: 平日
+    "J": ("支援", "日直"),        #              日直
+    "K": ("支援", "当直"),        #              当直
+}
+
+# 外病院内の code-2 境界（Q相当）を名前優先で特定するためのキーワード（無ければ相対位置）
+_Q_ANCHOR_KEYWORD = "しのぶ"
+
+
+def _resolve_column_anchors(header_cols, kate_toban_col=None):
+    """sheet1のヘッダ名から列役割アンカー(B〜Y)を名前解決する。
+
+    - 大学系開始(B)・休日大学範囲(C〜H)・支援平日範囲(I〜K) はヘッダ名パターンで特定
+    - 外病院範囲(L〜Y) は「大学/支援/カテ当番/Date 以外」の連続ブロックとして特定
+      （L=先頭, Y=末尾, M/U=相対位置, Q=code-2境界は名前優先→相対位置フォールバック）
+    - 解決結果を標準位置(_STANDARD_COL_ANCHORS)と照合し、
+      不一致なら「⚠️ 列構成が標準と異なります」を返して名前解決側を採用する
+    - 名前解決できない役割のみ従来の位置固定にフォールバックし警告する
+      （min()クランプの黙殺は撤去。範囲重複・逆転は致命 ValueError）
+
+    Args:
+        header_cols: sheet1のヘッダ名列（先頭=日付列を含む全列）
+        kate_toban_col: カテ当番列名（外病院範囲から除外するため）
+
+    Returns:
+        (anchors: dict[str,int], warnings: list[str])
+        anchors は B/C/D/E/F/G/H/I/J/K/L/M/Q/U/Y の15キーを持つ
+
+    Raises:
+        ValueError: 役割範囲が重複・逆転して解決不能な場合（プリフライト致命）
+    """
+    names = [str(c).strip() for c in header_cols]
+    n = len(names)
+    kate = str(kate_toban_col).strip() if kate_toban_col is not None else None
+
+    def _clamp(idx):
+        return max(0, min(idx, n - 1))
+
+    def _find_all(parts):
+        return [i for i, s in enumerate(names)
+                if i > 0 and s != "" and all(p in s for p in parts)]
+
+    warnings = []
+    resolved = {}          # 名前解決に成功した役割
+    fallback_keys = []     # 位置固定にフォールバックした役割
+
+    # --- 大学系(B)・休日大学(C〜H)・支援(I〜K) を名前解決 ---
+    for key, parts in _ANCHOR_NAME_RULES.items():
+        hits = _find_all(parts)
+        if len(hits) == 1:
+            resolved[key] = hits[0]
+        elif len(hits) >= 2:
+            resolved[key] = hits[0]
+            warnings.append(
+                f"列役割 {key}（{'/'.join(parts)}）が複数該当: "
+                f"{[names[i] for i in hits]} → 先頭「{names[hits[0]]}」を採用"
+            )
+        else:
+            fallback_keys.append(key)
+            resolved[key] = _clamp(_STANDARD_COL_ANCHORS[key])
+
+    # --- 大学系(B〜H)・支援(I〜K) の昇順（重複・逆転）チェック ---
+    # min()クランプ（役割衝突の黙殺）を撤去したため、ここで明示的に致命化する。
+    univ_order = ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]
+    for a, b in zip(univ_order, univ_order[1:]):
+        if resolved[a] >= resolved[b]:
+            raise ValueError(
+                "プリフライト: 列役割の範囲が重複・逆転しています: "
+                f"{a}={resolved[a]}(<{names[resolved[a]]}>) >= {b}={resolved[b]}(<{names[resolved[b]]}>)"
+            )
+
+    # --- 外病院範囲(L〜Y): 支援範囲(K)の直後〜カテ当番/末尾の連続ブロック ---
+    # 位置ベースで区切り、その内側に大学/支援列が割り込んだ場合のみ致命化する
+    # （名前ネガティブ判定だと氏名の付け忘れ列を外病院に誤取り込みするため）。
+    k_end = resolved["K"]
+    kate_idx = next((i for i, s in enumerate(names) if i > 0 and s == kate), None) if kate else None
+    L = k_end + 1
+    Y = (kate_idx - 1) if kate_idx is not None else (n - 1)
+
+    if L <= Y and Y < n:
+        # 割り込みチェック: 外病院範囲の内側に大学/支援列があれば範囲重複＝致命
+        intruders = [names[i] for i in range(L, Y + 1)
+                     if "大学" in names[i] or "支援" in names[i]]
+        if intruders:
+            raise ValueError(
+                "プリフライト: 外病院範囲(L〜Y)の内側に大学/支援列が割り込んでいます: "
+                f"{intruders}（列の並びを確認してください）"
+            )
+        resolved["L"] = L
+        resolved["Y"] = Y
+        resolved["M"] = _clamp(L + 1)                       # 相対位置（現状未使用だが互換維持）
+        resolved["U"] = min(L + (_STANDARD_COL_ANCHORS["U"] - _STANDARD_COL_ANCHORS["L"]), Y)
+        # code-2 境界(Q): 外病院内を名前優先、無ければ標準相対位置（範囲内にクランプ）
+        q_hits = [i for i in range(L, Y + 1) if _Q_ANCHOR_KEYWORD in names[i]]
+        if len(q_hits) >= 1:
+            resolved["Q"] = q_hits[0]
+        else:
+            resolved["Q"] = min(L + (_STANDARD_COL_ANCHORS["Q"] - _STANDARD_COL_ANCHORS["L"]), Y)
+            fallback_keys.append("Q")
+    else:
+        # 外病院列が存在しない（大学/支援のみ）→ 空範囲にして下流の L<=idx<=Y を常に偽に
+        for key in ("L", "M", "Q", "U", "Y"):
+            fallback_keys.append(key)
+        resolved["L"] = n            # L > Y の空範囲（外病院枠に一致する列が無い）
+        resolved["Y"] = n - 1
+        resolved["M"] = n
+        resolved["U"] = n
+        resolved["Q"] = k_end        # code-2境界は大学/支援末尾（外病院を許可しない）
+        warnings.append(
+            "外病院列（支援範囲の直後〜カテ当番の間）が見つかりません。"
+            "外病院枠なしとして続行します（テンプレの列構成を確認してください）"
+        )
+
+    # --- 標準位置との照合 ---
+    if fallback_keys:
+        warnings.append(
+            "列名から解決できず位置固定にフォールバックした役割: "
+            + ", ".join(sorted(set(fallback_keys), key=lambda k: _STANDARD_COL_ANCHORS[k]))
+            + "（テンプレのヘッダ名を確認してください）"
+        )
+
+    name_resolved_diffs = {
+        k: (_STANDARD_COL_ANCHORS[k], resolved[k])
+        for k in resolved
+        if k not in fallback_keys and resolved[k] != _STANDARD_COL_ANCHORS[k]
+    }
+    if name_resolved_diffs:
+        detail = ", ".join(
+            f"{k}: 標準{std}→{got}（{names[got]}）"
+            for k, (std, got) in sorted(name_resolved_diffs.items(),
+                                        key=lambda kv: _STANDARD_COL_ANCHORS[kv[0]])
+        )
+        warnings.append(f"⚠️ 列構成が標準と異なります: {detail} → 名前解決側を採用します")
+
+    return resolved, warnings
+
+
+# =========================
 # 入力ファイルの読み込み〜Excel出力パイプライン
 # =========================
 def run(input_path, output_dir=None, num_patterns=None):
@@ -790,7 +948,7 @@ def run(input_path, output_dir=None, num_patterns=None):
     global _str_display_width, _auto_format_sheet, _format_summary_sheet, write_combined_summary_sheet, writer, rank, entry, axis_label, sheet_label, pdf
     global ws, axis_short, df_month, df_total, df_doctors, df_gap, df_same, df_hdup, df_weekly_bg, df_unass
     global df_metrics, df_hard_violations, _BFont, _BFill, _rank, _entry, _slabel, _pws, _n_viol, _btext
-    global _bfill, _bfont, _bcell, _ci
+    global _bfill, _bfont, _bcell, _ci, _anchors, _anchor_warnings, _aw
 
     NUM_PATTERNS = int(num_patterns) if num_patterns is not None else _cfg.NUM_PATTERNS
 
@@ -955,24 +1113,31 @@ def run(input_path, output_dir=None, num_patterns=None):
 
     n_cols = len(shift_df.columns)
 
-    # 列インデックス（テンプレ依存：B〜Y を想定）
-    B_COL_INDEX = 1
-    C_COL_INDEX = 2
-    D_COL_INDEX = min(3, n_cols - 1)
-    E_COL_INDEX = min(4, n_cols - 1)
-    F_COL_INDEX = min(5, n_cols - 1)
-    G_COL_INDEX = min(6, n_cols - 1)
-    H_COL_INDEX = min(7, n_cols - 1)
-    I_COL_INDEX = min(8, n_cols - 1)
-    J_COL_INDEX = min(9, n_cols - 1)
-    K_COL_INDEX = min(10, n_cols - 1)
-    L_COL_INDEX = min(11, n_cols - 1)
-    M_COL_INDEX = min(12, n_cols - 1)
-    Q_COL_INDEX = min(16, n_cols - 1)
-    U_COL_INDEX = min(20, n_cols - 1)
-    Y_COL_INDEX = min(24, n_cols - 1)
+    # 列インデックス（v6.10.0 / 中期#5）: ヘッダ名から役割アンカーを解決する。
+    # min()クランプ（役割衝突の黙殺）は撤去。名前解決できた役割はそのまま採用し、
+    # 標準位置と異なれば警告。解決不能な役割のみ従来の位置固定にフォールバック。
+    _anchors, _anchor_warnings = _resolve_column_anchors(
+        list(shift_df.columns), kate_toban_col=KATE_TOBAN_COL)
+    for _aw in _anchor_warnings:
+        print(_aw if _aw.startswith("⚠️") else f"⚠️ {_aw}")
 
-    # 列範囲定義
+    B_COL_INDEX = _anchors["B"]
+    C_COL_INDEX = _anchors["C"]
+    D_COL_INDEX = _anchors["D"]
+    E_COL_INDEX = _anchors["E"]
+    F_COL_INDEX = _anchors["F"]
+    G_COL_INDEX = _anchors["G"]
+    H_COL_INDEX = _anchors["H"]
+    I_COL_INDEX = _anchors["I"]
+    J_COL_INDEX = _anchors["J"]
+    K_COL_INDEX = _anchors["K"]
+    L_COL_INDEX = _anchors["L"]
+    M_COL_INDEX = _anchors["M"]
+    Q_COL_INDEX = _anchors["Q"]
+    U_COL_INDEX = _anchors["U"]
+    Y_COL_INDEX = _anchors["Y"]
+
+    # 列範囲定義（アンカー解決結果から導出）
     B_H_START_INDEX = B_COL_INDEX  # 大学系前半（2回まで）
     B_H_END_INDEX = H_COL_INDEX
     I_K_START_INDEX = I_COL_INDEX  # 大学系後半
@@ -980,7 +1145,7 @@ def run(input_path, output_dir=None, num_patterns=None):
     B_K_START_INDEX = B_COL_INDEX  # 大学系全体
     B_K_END_INDEX = K_COL_INDEX
     L_Y_START_INDEX = L_COL_INDEX  # 外病院
-    L_Y_END_INDEX = min(Y_COL_INDEX, n_cols - 1)
+    L_Y_END_INDEX = Y_COL_INDEX
 
     print(f"\n✅ Excel読込完了: 医師{len(doctor_names)}人 | 病院{len(hospital_cols)}列 | {len(shift_df)}日間")
 

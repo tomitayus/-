@@ -1,7 +1,8 @@
 # 当直くん v6.5 制約仕様書
 
 > 本ドキュメントは制約ルールの完全な定義を提供します。
-> 実装コード: `colab_duty_scheduler.py` (v6.5.6)
+> 実装コード（正本）: `main.py`（現行版数はmain.pyのVERSION定数を参照）
+> ※`colab_duty_scheduler.py`(v6.7.0)は旧Colab版で、v6.5.9以降の公平性修正を含まない
 
 ---
 

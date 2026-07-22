@@ -29,6 +29,7 @@ main.py には一切依存しない（import しない）。
 
 import argparse
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -84,9 +85,15 @@ try:
     import config as _cfg
     WED_FORBIDDEN_DEFAULT = list(getattr(_cfg, "WED_FORBIDDEN_DOCTORS", []))
     CFG_HOLIDAYS = list(getattr(_cfg, "HOLIDAYS", []))
+    GAIKIN_HOSPITAL_GROUPS = dict(getattr(_cfg, "GAIKIN_HOSPITAL_GROUPS", {}) or {})
+    GAIKIN_EXCEPTIONS = dict(getattr(_cfg, "GAIKIN_EXCEPTIONS", {}) or {})
+    TEAM_SLOT_RESTRICTIONS = list(getattr(_cfg, "TEAM_SLOT_RESTRICTIONS", []) or [])
 except Exception:
     WED_FORBIDDEN_DEFAULT = ["金城", "山田", "野寺"]
     CFG_HOLIDAYS = []
+    GAIKIN_HOSPITAL_GROUPS = {}
+    GAIKIN_EXCEPTIONS = {}
+    TEAM_SLOT_RESTRICTIONS = []
 
 
 # =========================
@@ -150,6 +157,154 @@ def is_slot_value(v):
 
 def norm_date(d):
     return pd.to_datetime(d).normalize().tz_localize(None)
+
+
+# =========================
+# 外勤（出張）可否レイヤ + チーム枠種制約（v6.11.0 / main.py から移植・同一挙動）
+# =========================
+TRAVEL_WEEKDAY_COL_RE = re.compile(r"^(出張|外勤)(日|曜日)\d*$")
+TRAVEL_DEST_COL_RE = re.compile(r"^(出張|外勤)先\d*$")
+
+
+def parse_travel_weekdays(value):
+    """出張日セルを曜日番号set（月=0..日=6）へ（「木・金」「木,金」「木曜」等に寛容）"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return set()
+    text = str(value).strip()
+    if not text or text.lower() in ("nan", "none"):
+        return set()
+    out = set()
+    for tok in re.split(r"[・,、，/／\s;；+＋]+", text):
+        tok = re.sub(r"(曜日|曜)$", "", tok.strip())
+        if tok in WEEKDAY_MAP:
+            out.add(WEEKDAY_MAP[tok])
+    return out
+
+
+def find_travel_weekday_columns(columns):
+    """Sheet3列名から出張曜日列を寛容に検出（出張日 / 出張曜日 / 外勤曜日2 等）"""
+    return [c for c in columns if TRAVEL_WEEKDAY_COL_RE.match(str(c).strip())]
+
+
+def find_travel_dest_columns(columns):
+    """Sheet3列名から出張先列を検出"""
+    return [c for c in columns if TRAVEL_DEST_COL_RE.match(str(c).strip())]
+
+
+def resolve_allow_columns(allow_list, hospital_cols, hospital_groups):
+    """allow エントリ（グループ名 or 病院列名）を実在の sheet1 病院列名 set へ解決"""
+    names = []
+    for a in allow_list or []:
+        a = str(a).strip()
+        if a in (hospital_groups or {}):
+            names.extend(hospital_groups[a])
+        else:
+            names.append(a)
+    resolved = set()
+    for nm in names:
+        nm_n = normalize_name(nm)
+        if not nm_n:
+            continue
+        for col in hospital_cols:
+            col_n = normalize_name(col)
+            if col_n == nm_n or (len(nm_n) >= 2 and nm_n in col_n):
+                resolved.add(col)
+    return resolved
+
+
+def match_gaikin_exception_key(dest, exception_keys):
+    """医師の出張先文字列に対応する GAIKIN_EXCEPTIONS キー（完全一致→部分一致）"""
+    d = normalize_name(dest)
+    if not d:
+        return None
+    for k in exception_keys:
+        if normalize_name(k) == d:
+            return k
+    for k in exception_keys:
+        kn = normalize_name(k)
+        if kn and (kn in d or d in kn):
+            return k
+    return None
+
+
+def build_travel_restriction_map(doctor_travel_wds, doctor_travel_dest, hospital_cols,
+                                 gaikin_exceptions, hospital_groups):
+    """{医師: {曜日: frozenset(許容列)}} を構築（空set=全面不可 / エントリなし=制限なし）。
+
+    同一日が複数オフセット（連続外勤の当日かつ前日）に該当する場合は許容列の積集合。
+    """
+    result = {}
+    ex_keys = list((gaikin_exceptions or {}).keys())
+    for doc, wds in (doctor_travel_wds or {}).items():
+        if not wds:
+            continue
+        offset_allow = {}
+        key = match_gaikin_exception_key((doctor_travel_dest or {}).get(doc, ""), ex_keys)
+        if key is not None:
+            for rule in gaikin_exceptions.get(key) or []:
+                try:
+                    off = int(rule.get("offset"))
+                except (TypeError, ValueError):
+                    continue
+                if off not in (0, -1):
+                    continue
+                cols = resolve_allow_columns(rule.get("allow"), hospital_cols, hospital_groups)
+                offset_allow[off] = offset_allow.get(off, set()) | cols
+        wd_map = {}
+        for w in range(7):
+            offsets = []
+            if w in wds:
+                offsets.append(0)
+            if (w + 1) % 7 in wds:
+                offsets.append(-1)
+            if not offsets:
+                continue
+            allowed = None
+            for off in offsets:
+                s = offset_allow.get(off, set())
+                allowed = set(s) if allowed is None else (allowed & s)
+            wd_map[w] = frozenset(allowed or set())
+        if wd_map:
+            result[doc] = wd_map
+    return result
+
+
+def _parse_weekday_value(v):
+    """weekday指定（int / "土" / "土曜" / "5"）を曜日番号 or None に正規化"""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        iv = int(v)
+        return iv if 0 <= iv <= 6 else None
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        iv = int(s)
+        return iv if 0 <= iv <= 6 else None
+    return WEEKDAY_MAP.get(re.sub(r"(曜日|曜)$", "", s))
+
+
+def normalize_team_slot_rules(rules):
+    """config.TEAM_SLOT_RESTRICTIONS を内部形式に正規化（main.py と同一挙動）"""
+    out = []
+    for r in rules or []:
+        docs = {normalize_name(x) for x in (r.get("doctors") or []) if normalize_name(x)}
+        if not docs:
+            continue
+        st = str(r.get("slot_type") or "").strip()
+        if st not in ("日直", "当直"):
+            st = None
+        rg_raw = str(r.get("range") or "").strip().lower()
+        if rg_raw in ("external", "外病院", "外", "ly", "l-y"):
+            rg = "external"
+        elif rg_raw in ("university", "大学", "大学系", "bk", "b-k"):
+            rg = "university"
+        else:
+            rg = "all"
+        out.append({"doctors": docs, "weekday": _parse_weekday_value(r.get("weekday")),
+                    "slot_type": st, "range": rg})
+    return out
 
 
 # =========================
@@ -298,11 +453,30 @@ class InputData:
         else:
             self.doctor_attribute = {d: "" for d in self.doctor_names}
 
-        travel_col = next((c for c in ["出張日", "出張曜日"] if c in sheet4_data.columns), None)
-        if travel_col:
-            self.doctor_travel_day = {d: get_str(d, travel_col) for d in self.doctor_names}
-        else:
-            self.doctor_travel_day = {d: "" for d in self.doctor_names}
+        # v6.11.0(提案#3/#4): 出張曜日（複数曜日・追加列対応）+ 出張先 + 例外ペア
+        travel_wd_cols = find_travel_weekday_columns(sheet4_data.columns)
+        travel_dest_cols = find_travel_dest_columns(sheet4_data.columns)
+        self.doctor_travel_day = {}
+        self.doctor_travel_wds = {}
+        self.doctor_travel_dest = {}
+        for d in self.doctor_names:
+            raws = [x for x in (get_str(d, c) for c in travel_wd_cols)
+                    if x and x.lower() not in ("nan", "none")]
+            self.doctor_travel_day[d] = raws[0] if raws else ""
+            wds = set()
+            for r in raws:
+                wds |= parse_travel_weekdays(r)
+            self.doctor_travel_wds[d] = wds
+            dests = [x for x in (get_str(d, c) for c in travel_dest_cols)
+                     if x and x.lower() not in ("nan", "none")]
+            self.doctor_travel_dest[d] = dests[0] if dests else ""
+        # モジュール属性を参照時に読む（テストの monkeypatch を有効にするため）
+        self.travel_restriction = build_travel_restriction_map(
+            self.doctor_travel_wds, self.doctor_travel_dest, self.hospital_cols,
+            GAIKIN_EXCEPTIONS, GAIKIN_HOSPITAL_GROUPS)
+
+        # v6.11.0(提案#6): チーム枠種制約
+        self.team_slot_rules = normalize_team_slot_rules(TEAM_SLOT_RESTRICTIONS)
 
         self.wed_forbidden = {normalize_name(d) for d in WED_FORBIDDEN_DEFAULT}
 
@@ -477,13 +651,15 @@ class InputData:
                   f" = {self.total_slots}枠（医師別目標を直読み）")
 
     # ---- 可否コード（main.py get_avail_code と同一挙動） ----
-    def avail_code(self, date, doc):
+    def avail_code(self, date, doc, ignore_travel=False):
         date = norm_date(date)
-        # 出張曜日の前日は不可（v6.5.0）
-        travel = self.doctor_travel_day.get(doc, "")
-        if travel and travel in WEEKDAY_MAP:
-            if date.weekday() == (WEEKDAY_MAP[travel] - 1) % 7:
-                return 0
+        # v6.11.0(提案#4): 出張曜日の前日+当日は不可（例外の許容列が空=全面不可のときのみ）
+        if not ignore_travel:
+            wd_map = self.travel_restriction.get(doc)
+            if wd_map is not None:
+                allowed = wd_map.get(date.weekday())
+                if allowed is not None and len(allowed) == 0:
+                    return 0
         code = None
         col = self.avail_col_of.get(doc)
         if col is not None:
@@ -524,6 +700,40 @@ class InputData:
 
     def is_ch_slot(self, hidx):
         return C_COL <= hidx <= H_COL
+
+    def travel_col_forbidden(self, doc, date, hosp):
+        """v6.11.0(提案#3): 例外ペアで列限定緩和された外勤日の許容列以外なら True。
+        全面不可（許容列なし）は avail_code=0 側で処理される。"""
+        wd_map = self.travel_restriction.get(doc)
+        if not wd_map:
+            return False
+        allowed = wd_map.get(norm_date(date).weekday())
+        if allowed is None or len(allowed) == 0:
+            return False
+        return hosp not in allowed
+
+    def team_slot_forbidden(self, doc, date, hidx):
+        """v6.11.0(提案#6): TEAM_SLOT_RESTRICTIONS に該当（=配置禁止）なら True"""
+        if not self.team_slot_rules:
+            return False
+        dow = norm_date(date).weekday()
+        for rule in self.team_slot_rules:
+            if doc not in rule["doctors"]:
+                continue
+            if rule["weekday"] is not None and dow != rule["weekday"]:
+                continue
+            st = rule["slot_type"]
+            if st == "日直" and hidx not in NICHOKU_COLS:
+                continue
+            if st == "当直" and hidx in NICHOKU_COLS:
+                continue
+            rg = rule["range"]
+            if rg == "university" and not (B_COL <= hidx <= K_COL):
+                continue
+            if rg == "external" and not (L_COL <= hidx <= self.ly_end):
+                continue
+            return True
+        return False
 
     def is_eligible_for_ch(self, doc, date):
         if doc in self.no_kate_doctors:
@@ -625,6 +835,12 @@ class InputData:
                 return "ABS-004"
             if norm_date(date).weekday() == 2 and doc in self.wed_forbidden:
                 return "ABS-005"
+        # v6.11.0: 外勤例外ペアの列限定（許容列以外は不可）
+        if self.travel_col_forbidden(doc, date, slot["hosp"]):
+            return "GAIKIN-EX"
+        # v6.11.0: チーム枠種制約
+        if self.team_slot_forbidden(doc, date, hidx):
+            return "TEAM-001"
         if self.is_ch_slot(hidx) and not self.is_eligible_for_ch(doc, date):
             return "ABS-013"
         # B列 × カテ保有 × カテ表なし: 属性2は禁止（ABS-015/SEMI-001緩和不可）
@@ -1074,8 +1290,8 @@ def verify_output(input_path, output_path, pattern_sheets):
     check_ids = [
         "ABS-001", "ABS-002", "ABS-003", "ABS-004", "ABS-005", "ABS-006",
         "ABS-007", "ABS-008", "ABS-009", "ABS-010", "ABS-011", "ABS-012",
-        "ABS-013", "ABS-014", "ABS-015", "ABS-016", "HARD-001", "HARD-002",
-        "SEMI-001週1",
+        "ABS-013", "ABS-014", "ABS-015", "ABS-016", "GAIKIN-EX", "TEAM-001",
+        "HARD-001", "HARD-002", "SEMI-001週1",
     ]
     desc = {
         "ABS-001": "可否コード0禁止", "ABS-002": "コード2はB-Q列のみ",
@@ -1089,6 +1305,8 @@ def verify_output(input_path, output_path, pattern_sheets):
         "ABS-013": "C-H列カテ当番必須", "ABS-014": "平日/休日差<=1",
         "ABS-015": "属性2のB列カテ表必須",
         "ABS-016": "日直（昼系C/E/G+支援日直J）は月1回まで",
+        "GAIKIN-EX": "外勤例外ペアの列限定（許容列以外は不可）",
+        "TEAM-001": "チーム枠種制約（医師集合×曜日×枠種別×列範囲の禁止）",
         "HARD-001": "B/I列1回まで",
         "HARD-002": "C-H/J-K列1回まで", "SEMI-001週1": "B列カテ緩和は週1回まで",
     }
@@ -1134,7 +1352,10 @@ def verify_output(input_path, output_path, pattern_sheets):
             date, hidx = slot["date"], slot["hidx"]
             code = data.avail_code(date, doc)
             # ABS-001〜003
-            if code == 0:
+            # v6.11.0: 固定割当が「外勤由来の自動0のみ」（sheet2明示0でない）の場合は
+            # 意図的配置として許容（main.py validate_absolute_constraints と同一挙動）
+            if code == 0 and not (
+                    slot["fixed"] and data.avail_code(date, doc, ignore_travel=True) != 0):
                 viols.append(("ABS-001", f"{doc} {date.date()} {slot['hosp']}"))
             if code == 2 and not (B_COL <= hidx <= Q_COL):
                 viols.append(("ABS-002", f"{doc} {date.date()} {slot['hosp']}"))
@@ -1146,6 +1367,12 @@ def verify_output(input_path, output_path, pattern_sheets):
                     viols.append(("ABS-004", f"{doc} {date.date()} {slot['hosp']}"))
                 if date.weekday() == 2 and doc in data.wed_forbidden:
                     viols.append(("ABS-005", f"{doc} {date.date()} {slot['hosp']}"))
+            # v6.11.0: GAIKIN-EX（外勤例外ペアの列限定）/ TEAM-001（チーム枠種制約）
+            # 固定割当は意図的配置として許容
+            if not slot["fixed"] and data.travel_col_forbidden(doc, date, slot["hosp"]):
+                viols.append(("GAIKIN-EX", f"{doc} {date.date()} {slot['hosp']}"))
+            if not slot["fixed"] and data.team_slot_forbidden(doc, date, hidx):
+                viols.append(("TEAM-001", f"{doc} {date.date()} {slot['hosp']}"))
             # ABS-013（固定割当は許容: main.py validateと同一）
             if (not slot["fixed"] and data.is_ch_slot(hidx)
                     and not data.is_eligible_for_ch(doc, date)):

@@ -9,9 +9,12 @@ solver_cpsat.py — 当直くん CP-SAT厳密解ソルバー（併走版 Phase 1
 
 制約の正本: docs/CONSTRAINT_RULES.md
 実装範囲:
-  - ABS-001〜015（絶対禁忌。ABS-009=全枠割当を含む）
+  - ABS-001〜016（絶対禁忌。ABS-009=全枠割当、ABS-012=大学系暦週(日〜土)1回、
+    ABS-016=日直月1回を含む）
   - HARD-001/002（B/I列1回まで・C-H/J-K列1回まで。カテ保有×属性1は緩和）
   - SEMI-001（B列カテ表必須。属性1は週1回まで緩和可＝違反数を第1目的で最小化）
+  - 学年クォータ制（v6.10.0）: Sheet3の「大学目標」「外目標」列があれば
+    医師別に (大学系=大学目標, 総数=大学目標+外目標) の等式制約に置換
 目的関数（辞書式）:
   1. SEMI-001違反数最小化
   2. 月内公平性 max(割当数)-min(割当数) 最小化
@@ -35,6 +38,10 @@ import pandas as pd
 from ortools.sat.python import cp_model
 
 SOLVER_VERSION = "cpsat_v1"
+
+# v6.10.0: 学年クォータ制の目標列名（main.py と同一）
+QUOTA_UNIV_COL = "大学目標"
+QUOTA_EXT_COL = "外目標"
 
 # =========================
 # 列インデックス定義（main.py と同一のテンプレ依存定義: B〜Y列）
@@ -366,7 +373,10 @@ class InputData:
                 except (TypeError, ValueError):
                     pass
 
-        # --- TARGET_CAP（main.py と同一アルゴリズム） ---
+        # --- v6.10.0: 学年クォータ制（「大学目標」「外目標」列があれば有効） ---
+        self._parse_quota(sheet4_data, name_match)
+
+        # --- TARGET_CAP（main.py と同一アルゴリズム / クォータ時は目標直読み） ---
         self._compute_target_cap()
 
     @staticmethod
@@ -391,6 +401,80 @@ class InputData:
         data["氏名"] = data["氏名"].astype(str).str.strip()
         data = data[(data["氏名"] != "") & (data["氏名"].str.lower() != "nan")].reset_index(drop=True)
         return data
+
+    def _parse_quota(self, sheet4_data, name_match):
+        """v6.10.0: 学年クォータ制の目標列パース＋検算（main.py と同一仕様）。
+
+        両列が存在すれば有効化し、医師別の (大学目標, 外目標) を直読みする。
+        片列のみ / 空欄・非数値・負数 / 氏名突合不能 / Σ不一致 は ValueError。
+        """
+        self.univ_target = {}
+        self.ext_target = {}
+        self.quota_enabled = False
+
+        has_univ = QUOTA_UNIV_COL in sheet4_data.columns
+        has_ext = QUOTA_EXT_COL in sheet4_data.columns
+        if not has_univ and not has_ext:
+            return
+        if has_univ != has_ext:
+            found = QUOTA_UNIV_COL if has_univ else QUOTA_EXT_COL
+            missing = QUOTA_EXT_COL if has_univ else QUOTA_UNIV_COL
+            raise ValueError(
+                f"学年クォータ制の目標列が片方だけ存在します"
+                f"（「{found}」あり /「{missing}」なし）。両列を入れるか、両列とも削除してください")
+
+        name_to_row = {normalize_name(r["氏名"]): r for _, r in sheet4_data.iterrows()}
+        bad = []
+        for doc in self.doctor_names:
+            pname = name_match.get(doc)
+            row = name_to_row.get(pname) if pname else None
+            if row is None:
+                bad.append(f"{doc}: 医師情報シートに行なし（氏名突合不可）")
+                continue
+            vals = {}
+            for col in (QUOTA_UNIV_COL, QUOTA_EXT_COL):
+                v = row.get(col)
+                fv = pd.to_numeric(v, errors="coerce")
+                if pd.isna(fv):
+                    bad.append(f"{doc}: 「{col}」が空欄/非数値")
+                    vals = None
+                    break
+                fv = float(fv)
+                if fv < 0 or fv != int(fv):
+                    bad.append(f"{doc}: 「{col}」が不正な値: {v!r}（0以上の整数のみ）")
+                    vals = None
+                    break
+                vals[col] = int(fv)
+            if vals is None:
+                continue
+            self.univ_target[doc] = vals[QUOTA_UNIV_COL]
+            self.ext_target[doc] = vals[QUOTA_EXT_COL]
+        if bad:
+            raise ValueError(
+                "学年クォータ制の目標列に不備のある医師がいます"
+                "（全員分入れるか列ごと削除してください）: " + ", ".join(bad[:10]))
+
+        # Σ(大学目標+外目標) と枠数の検算（active医師のみ・差分表示）
+        n_univ = sum(1 for s in self.slots if B_COL <= s["hidx"] <= K_COL)
+        n_ext = sum(1 for s in self.slots if L_COL <= s["hidx"] <= self.ly_end)
+        sum_univ = sum(self.univ_target.get(d, 0) for d in self.active_doctors)
+        sum_ext = sum(self.ext_target.get(d, 0) for d in self.active_doctors)
+        fatals = []
+        if sum_univ + sum_ext != self.total_slots:
+            fatals.append(f"Σ(大学目標+外目標)={sum_univ + sum_ext} が総枠数{self.total_slots}と不一致"
+                          f"（差分 {sum_univ + sum_ext - self.total_slots:+d}）")
+        if sum_univ != n_univ:
+            fatals.append(f"Σ大学目標={sum_univ} が大学系(B-K)枠数{n_univ}と不一致"
+                          f"（差分 {sum_univ - n_univ:+d}）")
+        if sum_ext != n_ext:
+            fatals.append(f"Σ外目標={sum_ext} が外病院(L-Y)枠数{n_ext}と不一致"
+                          f"（差分 {sum_ext - n_ext:+d}）")
+        if fatals:
+            raise ValueError("学年クォータ制の検算エラー: " + " / ".join(fatals))
+
+        self.quota_enabled = True
+        self._log(f"✅ 学年クォータ制: Σ大学目標={sum_univ} + Σ外目標={sum_ext}"
+                  f" = {self.total_slots}枠（医師別目標を直読み）")
 
     # ---- 可否コード（main.py get_avail_code と同一挙動） ----
     def avail_code(self, date, doc):
@@ -465,6 +549,22 @@ class InputData:
         self.base_target = self.total_slots // len(active)
         self.extra_slots = self.total_slots - self.base_target * len(active)
         active_sorted = sorted(active, key=lambda d: self.doctor_col_index[d])
+
+        # v6.10.0: 学年クォータ制 — TARGET_CAP=大学目標+外目標・EXTRA概念なし
+        if self.quota_enabled:
+            self.extra_allowed = set()
+            cap = {d: 0 for d in self.doctor_names}
+            for d in active:
+                cap[d] = self.univ_target.get(d, 0) + self.ext_target.get(d, 0)
+            over = [d for d in self.doctor_names
+                    if self.preassigned_count.get(d, 0) > cap.get(d, 0)]
+            if over:
+                raise ValueError(
+                    "固定割当が目標回数を超えている医師がいます: "
+                    + ", ".join(f"{d}(固定{self.preassigned_count[d]} > 目標{cap.get(d, 0)})"
+                                for d in over))
+            self.target_cap = cap
+            return
 
         attr1 = [d for d in active_sorted if self.doctor_attribute.get(d, "") == "1"]
         if self.extra_slots > 0 and len(attr1) >= self.extra_slots:
@@ -548,10 +648,26 @@ class InputData:
         """HARD-001/002の緩和対象（カテ保有×sheet3「1」相当）か"""
         return doc in self.schedule_code_holders and doc in self.sheet3_code1
 
+    def univ_cap(self, doc):
+        """大学系(B-K)上限。既定2回・クォータ有効時は医師別「大学目標」（v6.10.0）"""
+        if self.quota_enabled:
+            return self.univ_target.get(doc, 0)
+        return 2
+
 
 def monday_week_start(date):
     d = norm_date(date)
     return d - pd.Timedelta(days=d.weekday())
+
+
+def sunday_week_start(date):
+    """暦週（日曜始まり〜土曜）の週開始日（日曜日）。ABS-012暦週ルールで使用（v6.10.0）"""
+    d = norm_date(date)
+    return d - pd.Timedelta(days=(d.weekday() + 1) % 7)
+
+
+# 日直枠（ABS-016: 昼系の大学休日 C=土曜昼/E=日曜昼/G=祝日昼 + J=支援日直）
+NICHOKU_COLS = (C_COL, E_COL, G_COL, J_COL)
 
 
 # =========================
@@ -611,6 +727,8 @@ class CpSatScheduler:
         bi_fixed = {d: 0 for d in docs}
         chjk_terms = {d: [] for d in docs}
         chjk_fixed = {d: 0 for d in docs}
+        nichoku_terms = {d: [] for d in docs}   # v6.10.0: ABS-016 日直
+        nichoku_fixed = {d: 0 for d in docs}
         hosp_terms = {d: defaultdict(list) for d in docs}
         hosp_fixed = {d: defaultdict(int) for d in docs}
         semi_terms = {d: defaultdict(list) for d in docs}  # doc -> week -> vars
@@ -623,6 +741,7 @@ class CpSatScheduler:
             is_hol = data.slot_is_holiday(date, hidx)
             is_bi = hidx in (B_COL, I_COL)
             is_chjk = (C_COL <= hidx <= H_COL) or (J_COL <= hidx <= K_COL)
+            is_nichoku = hidx in NICHOKU_COLS  # v6.10.0: ABS-016
             if slot["fixed"]:
                 d = slot["doc"]
                 if d not in data.active_doctors:
@@ -643,6 +762,8 @@ class CpSatScheduler:
                     bi_fixed[d] += 1
                 if is_chjk:
                     chjk_fixed[d] += 1
+                if is_nichoku:
+                    nichoku_fixed[d] += 1
             else:
                 for d in docs:
                     v = self.x.get((si, d))
@@ -664,6 +785,8 @@ class CpSatScheduler:
                         bi_terms[d].append(v)
                     if is_chjk:
                         chjk_terms[d].append(v)
+                    if is_nichoku:
+                        nichoku_terms[d].append(v)
                     if data.is_semi001_relax_slot(slot, d):
                         semi_terms[d][monday_week_start(date)].append(v)
                         all_semi_vars.append(v)
@@ -706,33 +829,46 @@ class CpSatScheduler:
                 elif len(terms) > 1:
                     m.AddAtMostOne(terms)
 
-        # --- ABS-010: TARGET_CAP ---
+        # --- ABS-010: TARGET_CAP（クォータ有効時は等式=目標回数ちょうど） ---
         self.count_expr = {}
         for d in docs:
             cnt = m.NewIntVar(0, data.target_cap.get(d, 0), f"cnt_{d}")
             m.Add(cnt == sum(cnt_terms[d]) + cnt_fixed[d])
+            if data.quota_enabled:
+                m.Add(cnt == data.target_cap.get(d, 0))
             self.count_expr[d] = cnt
 
-        # --- ABS-011: 大学系2回まで ---
+        # --- ABS-011: 大学系上限（既定2回・クォータ有効時は「大学目標」との等式） ---
         for d in docs:
-            m.Add(sum(bg_terms[d]) + bg_fixed[d] <= 2)
+            if data.quota_enabled:
+                m.Add(sum(bg_terms[d]) + bg_fixed[d] == data.univ_target.get(d, 0))
+            else:
+                m.Add(sum(bg_terms[d]) + bg_fixed[d] <= 2)
 
-        # --- ABS-012: 大学系7日間隔 ---
+        # --- ABS-012: 大学系は暦週(日曜始まり〜土曜)で1回まで（v6.10.0: ローリング7日→暦週） ---
         for d in docs:
-            bg_dates = [dt for dt in dates
-                        if self.bg_day_terms[d].get(dt) or self.bg_day_fixed[d].get(dt, 0)]
-            for i in range(len(bg_dates)):
-                for j in range(i + 1, len(bg_dates)):
-                    diff = (bg_dates[j] - bg_dates[i]).days
-                    if diff >= 7:
-                        break
-                    t1 = self.bg_day_terms[d].get(bg_dates[i], [])
-                    t2 = self.bg_day_terms[d].get(bg_dates[j], [])
-                    f = (self.bg_day_fixed[d].get(bg_dates[i], 0)
-                         + self.bg_day_fixed[d].get(bg_dates[j], 0))
-                    if f >= 2:
-                        raise RuntimeError(f"固定割当がBG gap<7で矛盾: {d}")
-                    m.Add(sum(t1) + sum(t2) + f <= 1)
+            week_terms = defaultdict(list)
+            week_fixed = defaultdict(int)
+            for dt in dates:
+                terms = self.bg_day_terms[d].get(dt)
+                fx = self.bg_day_fixed[d].get(dt, 0)
+                if not terms and not fx:
+                    continue
+                wk = sunday_week_start(dt)
+                if terms:
+                    week_terms[wk].extend(terms)
+                week_fixed[wk] += fx
+            for wk in set(week_terms) | set(week_fixed):
+                fx = week_fixed.get(wk, 0)
+                if fx >= 2:
+                    raise RuntimeError(f"固定割当がBG暦週2回で矛盾: {d} 週={wk.date()}")
+                m.Add(sum(week_terms.get(wk, [])) + fx <= 1)
+
+        # --- ABS-016: 日直（昼系C/E/G+支援日直J）は月1回まで（v6.10.0） ---
+        for d in docs:
+            if nichoku_fixed[d] >= 2:
+                raise RuntimeError(f"固定割当が日直月1回(ABS-016)で矛盾: {d}")
+            m.Add(sum(nichoku_terms[d]) + nichoku_fixed[d] <= 1)
 
         # --- ABS-014: 平日/休日偏り差<=1 ---
         for d in docs:
@@ -769,8 +905,9 @@ class CpSatScheduler:
         # --- SOFT簡易版 ---
         soft_terms = []
         for d in docs:
-            # SOFT: 外病院0回（外病院に入りうる医師のみ）
-            if ht_terms[d] or ht_fixed[d]:
+            # SOFT: 外病院0回（外病院に入りうる医師のみ。クォータで外目標=0の医師は対象外）
+            if (ht_terms[d] or ht_fixed[d]) and not (
+                    data.quota_enabled and data.ext_target.get(d, 0) == 0):
                 h0 = m.NewBoolVar(f"ht0_{d}")
                 m.Add(sum(ht_terms[d]) + ht_fixed[d] >= 1 - h0)
                 soft_terms.append(self.W_SOFT_HT0 * h0)
@@ -937,17 +1074,22 @@ def verify_output(input_path, output_path, pattern_sheets):
     check_ids = [
         "ABS-001", "ABS-002", "ABS-003", "ABS-004", "ABS-005", "ABS-006",
         "ABS-007", "ABS-008", "ABS-009", "ABS-010", "ABS-011", "ABS-012",
-        "ABS-013", "ABS-014", "ABS-015", "HARD-001", "HARD-002", "SEMI-001週1",
+        "ABS-013", "ABS-014", "ABS-015", "ABS-016", "HARD-001", "HARD-002",
+        "SEMI-001週1",
     ]
     desc = {
         "ABS-001": "可否コード0禁止", "ABS-002": "コード2はB-Q列のみ",
         "ABS-003": "コード3はL-Y列のみ", "ABS-004": "カテ当番日の外病院禁止",
         "ABS-005": "水曜L-Y禁止医師", "ABS-006": "同日重複禁止",
         "ABS-007": "gap>=3日", "ABS-008": "同一病院重複禁止",
-        "ABS-009": "全枠割当（未割当/不明医師なし）", "ABS-010": "TARGET_CAP厳守",
-        "ABS-011": "大学系2回まで", "ABS-012": "大学系7日間隔",
+        "ABS-009": "全枠割当（未割当/不明医師なし）",
+        "ABS-010": "TARGET_CAP厳守（クォータ時は目標回数と一致）",
+        "ABS-011": "大学系上限（既定2回・クォータ時は大学目標と一致）",
+        "ABS-012": "大学系は暦週(日〜土)1回まで",
         "ABS-013": "C-H列カテ当番必須", "ABS-014": "平日/休日差<=1",
-        "ABS-015": "属性2のB列カテ表必須", "HARD-001": "B/I列1回まで",
+        "ABS-015": "属性2のB列カテ表必須",
+        "ABS-016": "日直（昼系C/E/G+支援日直J）は月1回まで",
+        "HARD-001": "B/I列1回まで",
         "HARD-002": "C-H/J-K列1回まで", "SEMI-001週1": "B列カテ緩和は週1回まで",
     }
 
@@ -983,6 +1125,7 @@ def verify_output(input_path, output_path, pattern_sheets):
         we_counts = defaultdict(int)
         bi_counts = defaultdict(int)
         chjk_counts = defaultdict(int)
+        nichoku_counts = defaultdict(int)     # v6.10.0: ABS-016
         doc_dates = defaultdict(set)
         bg_dates = defaultdict(set)
         semi_week = defaultdict(int)          # (doc,week)
@@ -1032,6 +1175,8 @@ def verify_output(input_path, output_path, pattern_sheets):
                 bi_counts[doc] += 1
             if (C_COL <= hidx <= H_COL) or (J_COL <= hidx <= K_COL):
                 chjk_counts[doc] += 1
+            if hidx in NICHOKU_COLS:
+                nichoku_counts[doc] += 1
 
         # ABS-006
         for (doc, date), c in day_count.items():
@@ -1048,21 +1193,40 @@ def verify_output(input_path, output_path, pattern_sheets):
         for (doc, hosp), c in hosp_count.items():
             if c > 1:
                 viols.append(("ABS-008", f"{doc} {hosp} ({c}回)"))
-        # ABS-010
-        for doc, c in counts.items():
-            if c > data.target_cap.get(doc, 0):
-                viols.append(("ABS-010", f"{doc} {c}回 (上限{data.target_cap.get(doc, 0)})"))
-        # ABS-011
-        for doc, c in bg_counts.items():
-            if c > 2:
-                viols.append(("ABS-011", f"{doc} 大学{c}回"))
-        # ABS-012
+        # ABS-010（クォータ有効時は目標回数との一致を検証）
+        if data.quota_enabled:
+            for doc in data.active_doctors:
+                c = counts.get(doc, 0)
+                if c != data.target_cap.get(doc, 0):
+                    viols.append(("ABS-010",
+                                  f"{doc} {c}回 (目標{data.target_cap.get(doc, 0)})"))
+        else:
+            for doc, c in counts.items():
+                if c > data.target_cap.get(doc, 0):
+                    viols.append(("ABS-010", f"{doc} {c}回 (上限{data.target_cap.get(doc, 0)})"))
+        # ABS-011（クォータ有効時は大学目標との一致を検証）
+        if data.quota_enabled:
+            for doc in data.active_doctors:
+                c = bg_counts.get(doc, 0)
+                if c != data.univ_target.get(doc, 0):
+                    viols.append(("ABS-011",
+                                  f"{doc} 大学{c}回 (目標{data.univ_target.get(doc, 0)})"))
+        else:
+            for doc, c in bg_counts.items():
+                if c > 2:
+                    viols.append(("ABS-011", f"{doc} 大学{c}回"))
+        # ABS-012（暦週=日曜始まりで1回まで）
         for doc, ds in bg_dates.items():
             sd = sorted(ds)
+            wks = [sunday_week_start(x) for x in sd]
             for i in range(1, len(sd)):
-                gap = (sd[i] - sd[i - 1]).days
-                if gap < 7:
-                    viols.append(("ABS-012", f"{doc} BG gap={gap}日"))
+                if wks[i] == wks[i - 1]:
+                    viols.append(("ABS-012",
+                                  f"{doc} 同一暦週にBG2回 ({sd[i-1].date()}/{sd[i].date()})"))
+        # ABS-016: 日直は月1回まで
+        for doc, c in nichoku_counts.items():
+            if c > 1:
+                viols.append(("ABS-016", f"{doc} 日直{c}回"))
         # ABS-014
         for doc in data.active_doctors:
             diff = abs(wd_counts.get(doc, 0) - we_counts.get(doc, 0))

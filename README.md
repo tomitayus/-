@@ -73,6 +73,28 @@ cd Tochoku-kun && bash run.sh
 python3 prepare_next_month.py <当月の出力.xlsx> <当月の雛形.xlsx> --pattern 1 -o <翌月ドラフト.xlsx>
 ```
 
+### 併走検証（当直くん vs 完成版）
+
+当直くん出力と手作り完成版を突き合わせ、セル相違・医師別回数差・一致率を出す:
+
+```bash
+python3 compare_schedules.py <当直くん.xlsx> <完成版.xlsx> --label-a 当直くん --label-b 完成版 -o <突合.md>
+```
+
+> 完成版は `pattern_01` シート（A1=`日付`・列並びは雛形 sheet1 と同じ）にするだけで突合対象になる。
+> 月次の運用フロー・フォルダ構成の詳細は **`docs/HEISOU_GUIDE.md`**。
+
+### 希望の収集・反映（Google Form）
+
+医局員の希望（避けたい/やりたい/当直不可）を Google Form で集め、入力に反映:
+
+```bash
+python3 build_wish_from_form.py <form_responses.csv> <入力.xlsx> -o <出力.xlsx>
+```
+
+> 「希望」シート（`×1〜×3`避け / `○1〜○3`やりたい）＋ `Sheet2` の `0`（不可）を自動生成。
+> 反映ロジックは `docs/WISH_CONSTRAINT_SPEC.md`、Form設計は `docs/WISH_FORM_DESIGN.md`。
+
 ### config.py の編集
 
 必要に応じて `config.py` を更新してください。

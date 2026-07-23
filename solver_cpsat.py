@@ -97,6 +97,8 @@ try:
     SOFT_AVOID_DOCTORS = list(getattr(_cfg, "SOFT_AVOID_DOCTORS", []) or [])
     W_SOFT_AVOID = getattr(_cfg, "W_SOFT_AVOID", 15)
     W_KATE_WEEKDAY_BONUS = getattr(_cfg, "W_KATE_WEEKDAY_BONUS", 0)
+    WISH_AVOID_BUDGET = getattr(_cfg, "WISH_AVOID_BUDGET", 0)  # 希望: 避け予算
+    WISH_WANT_BUDGET = getattr(_cfg, "WISH_WANT_BUDGET", 0)    # 希望: やりたい予算(v2)
 except Exception:
     WED_FORBIDDEN_DEFAULT = ["金城", "山田", "野寺"]
     CFG_HOLIDAYS = []
@@ -108,6 +110,8 @@ except Exception:
     SOFT_AVOID_DOCTORS = []
     W_SOFT_AVOID = 15
     W_KATE_WEEKDAY_BONUS = 0
+    WISH_AVOID_BUDGET = 0
+    WISH_WANT_BUDGET = 0
 
 
 # =========================
@@ -167,6 +171,70 @@ def is_slot_value(v):
     if isinstance(v, (int, float, np.integer, np.floating)):
         return float(v) == 1.0
     return False
+
+
+# 希望シートのマーク記号: ×N=避け（負）/ ○N=やりたい（正）
+_WISH_AVOID_HEADS = ("×", "✕", "✗", "x", "X", "ｘ", "Ｘ")
+_WISH_WANT_HEADS = ("○", "◯", "〇", "◎")
+
+
+def parse_wish_mark(v):
+    """希望シートのセルを符号付き段階に変換。避け ×N→ -N / やりたい ○N→ +N（|N|=1..3）。
+
+    記号のみ（`×`/`○`）は段階1。希望なし（空欄・数値のみ）や範囲外(×4以上)は None。
+    main.py 側と完全同一ロジック（二重パースの整合のため）。
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    head = s[0]
+    if head in _WISH_AVOID_HEADS:
+        sign = -1
+    elif head in _WISH_WANT_HEADS:
+        sign = 1
+    else:
+        return None
+    rest = s[1:].strip()
+    if rest == "":
+        return sign
+    try:
+        stage = int(float(rest))
+    except ValueError:
+        return None
+    return sign * stage if 1 <= stage <= 3 else None
+
+
+def wish_signed_weights(marks, avoid_budget, want_budget):
+    """符号付きマーク {doc:{date: ±段階}} → {doc:{date: int重み}}。
+
+    正の重み=避けペナルティ（避け日に割当で加算）／負の重み=やりたい加点。
+    避け・やりたいは別予算・各々「その医師の段階合計」で正規化（多いほど薄まる）。
+    main.py 側と完全同一ロジック（二重パースの整合のため）。
+    """
+    out = {}
+    for d, dm in (marks or {}).items():
+        avoid = {dt: -st for dt, st in dm.items() if st < 0}  # 避け段階を正値化
+        want = {dt: st for dt, st in dm.items() if st > 0}
+        wd = {}
+        sa = sum(avoid.values())
+        if avoid_budget > 0 and sa > 0:
+            for dt, st in avoid.items():
+                w = int(round(avoid_budget * st / sa))
+                if w > 0:
+                    wd[dt] = w
+        sw = sum(want.values())
+        if want_budget > 0 and sw > 0:
+            for dt, st in want.items():
+                w = int(round(want_budget * st / sw))
+                if w > 0:
+                    wd[dt] = -w  # 加点は負符号（MINIMIZEで希望日へ引き寄せ）
+        if wd:
+            out[d] = wd
+    return out
 
 
 def norm_date(d):
@@ -371,6 +439,20 @@ class InputData:
         self.doctor_names = [normalize_name(x) for x in avail_raw.columns[1:]]
         self.doctor_col_index = {d: i for i, d in enumerate(self.doctor_names)}
 
+        # --- 希望シート（v1: 避け専用。任意。無ければ従来動作） ---
+        self.wish_df = None
+        self.wish_col_of = None
+        wish_sheet = find_sheet_name(xls, "希望")
+        if wish_sheet is not None:
+            wish_raw = pd.read_excel(xls, sheet_name=wish_sheet)
+            wish_raw.columns = make_unique(
+                [c.strip() if isinstance(c, str) else c for c in wish_raw.columns])
+            wcol0 = wish_raw.columns[0]
+            wish_raw[wcol0] = pd.to_datetime(
+                wish_raw[wcol0], errors="coerce").dt.normalize().dt.tz_localize(None)
+            self.wish_df = wish_raw.set_index(wcol0)
+            self.wish_col_of = {normalize_name(c): c for c in wish_raw.columns[1:]}
+
         # --- 祝日（jpholiday試行 → 内蔵祝日表。config.HOLIDAYSは常に追加） ---
         self.holidays = set()
         sched_dates = shift_df[self.date_col].dropna()
@@ -526,6 +608,9 @@ class InputData:
         self.total_slots = len(self.slots)
         self.all_shift_dates = sorted(
             {norm_date(d) for d in shift_df[self.date_col].dropna()})
+
+        # 希望(避け)の生マーク（予算非依存。正規化は build 時 wish_weights で）
+        self.wish_marks = self._collect_wish_marks()
 
         # --- 医師分類 ---
         self.inactive_doctors = [d for d in self.doctor_names
@@ -703,6 +788,45 @@ class InputData:
         if code is None:
             code = 1  # 空欄・解釈不能は「可」（v6.5.9仕様）
         return code
+
+    def wish_stage(self, date, doc):
+        """希望シートの符号付き段階（避け -1..-3 / やりたい +1..+3）。無し/不正は0。"""
+        if not self.wish_col_of:
+            return 0
+        col = self.wish_col_of.get(doc)
+        if col is None:
+            return 0
+        date = norm_date(date)
+        try:
+            v = self.wish_df.at[date, col]
+            if isinstance(v, pd.Series):
+                v = v.iloc[0]
+        except (KeyError, TypeError, ValueError):
+            return 0
+        return parse_wish_mark(v) or 0
+
+    def _collect_wish_marks(self):
+        """医師→{date: 符号付き段階}。予算非依存の生マーク（避け負・やりたい正・無ければ空）。"""
+        marks = {}
+        if not self.wish_col_of:
+            return marks
+        for d in self.doctor_names:
+            dd = {}
+            for dt in self.all_shift_dates:
+                st = self.wish_stage(dt, d)
+                if st:
+                    dd[dt] = st
+            if dd:
+                marks[d] = dd
+        return marks
+
+    def wish_weights(self, avoid_budget, want_budget):
+        """符号付きマーク → 医師→{date: int重み}。正=避けペナルティ / 負=やりたい加点。
+
+        避け・やりたいで別予算・各々段階合計で正規化（多く出すほど薄まる）。
+        budget は build 時に読む（テスト monkeypatch 対応）。main.py と同一ロジック。
+        """
+        return wish_signed_weights(self.wish_marks, avoid_budget, want_budget)
 
     # ---- カテ表コード（main.py get_sched_code の新構造分） ----
     def sched_code(self, date, doc):
@@ -1181,6 +1305,21 @@ class CpSatScheduler:
             for d in docs:
                 if d in avoid_set and cnt_terms[d]:
                     soft_terms.append(W_SOFT_AVOID * sum(cnt_terms[d]))
+
+        # --- 希望ソフト制約（日単位・予算正規化）: 避け×N / やりたい○N ---
+        # 符号付き重み: 正=避け日に割当でペナルティ / 負=希望日に割当で加点（MINIMIZEで引き寄せ）。
+        # 予算B×段階/段階合計を整数化（多く出すほど薄まる）。固定枠は動かせないので自由枠のみ。
+        # 重みは公平(W_FAIR=1e5)より遥かに小さく＝休日↔休日の振替でのみ効く（総数不変）。
+        if (WISH_AVOID_BUDGET > 0 or WISH_WANT_BUDGET > 0) and getattr(data, "wish_marks", None):
+            wish_w = data.wish_weights(WISH_AVOID_BUDGET, WISH_WANT_BUDGET)
+            for d in docs:
+                wmap = wish_w.get(d)
+                if not wmap:
+                    continue
+                for date, w in wmap.items():
+                    terms = self.day_terms[d].get(date)
+                    if terms:
+                        soft_terms.append(w * sum(terms))
 
         # --- v6.12.0(提案#10): カテ番×平日大学の「できれば合わせる」加点 ---
         if W_KATE_WEEKDAY_BONUS > 0 and kate_bonus_vars:

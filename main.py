@@ -411,6 +411,7 @@ CUM_FAIRNESS_EXEMPT = list(getattr(_cfg, 'CUM_FAIRNESS_EXEMPT', []) or [])  # �
 SOFT_AVOID_DOCTORS = list(getattr(_cfg, 'SOFT_AVOID_DOCTORS', []) or [])    # ソフト回避医師
 W_SOFT_AVOID = getattr(_cfg, 'W_SOFT_AVOID', 15)   # ソフト回避: 割当1回ごとの軽ペナルティ
 W_KATE_WEEKDAY_BONUS = getattr(_cfg, 'W_KATE_WEEKDAY_BONUS', 0)  # カテ番×平日大学一致の加点。0=無効
+WISH_AVOID_BUDGET = getattr(_cfg, 'WISH_AVOID_BUDGET', 0)  # 希望ソフト制約v1（避け予算）。0=無効
 
 # =========================
 # 制約ID定義（v5.2仕様書準拠）
@@ -499,6 +500,85 @@ def find_sheet_name(xls: pd.ExcelFile, target: str):
         if s.strip().lower() == target.strip().lower():
             return s
     return None
+
+
+# ---- 希望ソフト制約 v1（避け専用）: solver_cpsat と完全同一ロジック ----
+_WISH_MARK_HEADS = ("×", "✕", "✗", "x", "X", "ｘ", "Ｘ")
+
+
+def parse_wish_mark(v):
+    """希望シートのセルを避け段階(1-3)に変換。×1/×2/×3・記号のみ・x表記→1..3。
+
+    希望なし（空欄・数値のみ）や範囲外(×4以上)は None。solver_cpsat と同一。
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return None
+    s = str(v).strip()
+    if not s or s[0] not in _WISH_MARK_HEADS:
+        return None
+    rest = s[1:].strip()
+    if rest == "":
+        return 1
+    try:
+        stage = int(float(rest))
+    except ValueError:
+        return None
+    return stage if 1 <= stage <= 3 else None
+
+
+def parse_wish_sheet(xls):
+    """「希望」シート → (marks {正規化医師名:{date:段階}}, invalid [(date,医師,値)])。
+
+    シート無し/空なら ({}, [])。数値・空欄は無視、不正な文字列マークだけ invalid。
+    """
+    wish_sheet = find_sheet_name(xls, "希望")
+    if wish_sheet is None:
+        return {}, []
+    raw = strip_cols(pd.read_excel(xls, sheet_name=wish_sheet))
+    raw.columns = make_unique(list(raw.columns))
+    if raw.shape[1] < 2 or raw.shape[0] == 0:
+        return {}, []
+    dcol = raw.columns[0]
+    raw[dcol] = pd.to_datetime(raw[dcol], errors="coerce").dt.normalize().dt.tz_localize(None)
+    marks = {}
+    invalid = []
+    for col in raw.columns[1:]:
+        doc = normalize_name(col)
+        dd = {}
+        for _, row in raw.iterrows():
+            dt = row[dcol]
+            v = row[col]
+            if pd.isna(dt) or pd.isna(v) or not isinstance(v, str):
+                continue
+            if not v.strip():
+                continue
+            st = parse_wish_mark(v)
+            if st:
+                dd[dt] = st
+            else:
+                invalid.append((dt, col, v))
+        if dd:
+            marks[doc] = dd
+    return marks, invalid
+
+
+def wish_day_weights(wish_marks, budget):
+    """{doc:{date:段階}} + 予算 → {doc:{date:int重み}}（段階合計で正規化）。solver_cpsat と同一。"""
+    out = {}
+    if budget <= 0:
+        return out
+    for d, marks in (wish_marks or {}).items():
+        total = sum(marks.values())
+        if total <= 0:
+            continue
+        wd = {dt: int(round(budget * st / total)) for dt, st in marks.items()}
+        wd = {dt: w for dt, w in wd.items() if w > 0}
+        if wd:
+            out[d] = wd
+    return out
+
 
 def is_slot_value(v) -> bool:
     if isinstance(v, str):
@@ -754,7 +834,8 @@ def normalize_team_slot_rules(rules):
 def preflight_validate(shift_df, date_col_shift, availability_df, doctor_names,
                        hospital_cols, holidays, name_match,
                        invalid_avail_marks=None, missing_avail_cols=None,
-                       travel_auto_ng=None, travel_partial=None):
+                       travel_auto_ng=None, travel_partial=None,
+                       wish_marks=None, invalid_wish=None):
     """入力読込直後の一括検証。致命は ValueError で停止、警告は表示して続行する。
 
     致命（例外で停止）:
@@ -892,6 +973,29 @@ def preflight_validate(shift_df, date_col_shift, availability_df, doctor_names,
     if unmatched:
         warnings.append(f"sheet4(前月累積)と氏名が一致しない医師（前月累積が0扱いになります）: {unmatched}"
                         " ※表記ゆれは config.NAME_ALIASES で対応可")
+
+    # ---- 希望シート（避け）の検証（v1） ----
+    if invalid_wish:
+        _iw = list(invalid_wish)
+        _shown = ", ".join(f"{pd.to_datetime(t):%Y-%m-%d} {d}: {v!r}" for t, d, v in _iw[:5])
+        _more = f" 他{len(_iw) - 5}件" if len(_iw) > 5 else ""
+        warnings.append(f"「希望」シートに解釈できないマークが{len(_iw)}件（無視されます・×1/×2/×3 のみ有効）: {_shown}{_more}")
+    if wish_marks:
+        _doc_set = set(doctor_names)
+        _unknown = [d for d in wish_marks if d not in _doc_set]
+        if _unknown:
+            warnings.append(f"「希望」シートの医師が名簿(sheet2)に無い（その希望は無視）: {_unknown}"
+                            " ※表記ゆれは config.NAME_ALIASES で対応可")
+        _conflicts = []
+        for _d, _dm in wish_marks.items():
+            for _dt in _dm:
+                if not _avail_ok(_dt, _d):
+                    _conflicts.append((_dt, _d))
+        if _conflicts:
+            _cs = ", ".join(f"{pd.to_datetime(t):%Y-%m-%d} {d}" for t, d in _conflicts[:5])
+            _cm = f" 他{len(_conflicts) - 5}件" if len(_conflicts) > 5 else ""
+            warnings.append(f"同じ日に可否(sheet2)=0(絶対不可)と避け希望(×)の併記が{len(_conflicts)}件"
+                            f"（0が優先・希望は無視）: {_cs}{_cm}")
 
     # ---- 表示 ----
     print("\n━━━━━━━━━━ プリフライト検証 ━━━━━━━━━━")
@@ -1373,6 +1477,10 @@ def run(input_path, output_dir=None, num_patterns=None):
     availability_raw[date_col_avail] = pd.to_datetime(availability_raw[date_col_avail], errors="coerce").dt.normalize().dt.tz_localize(None)  # 🔧 FIX
     availability_df = availability_raw.set_index(date_col_avail)
 
+    # --- 希望シート（v1: 避け専用。任意。無ければ従来動作） ---
+    _wish_marks, _invalid_wish = parse_wish_sheet(xls)
+    WISH_WEIGHT = wish_day_weights(_wish_marks, WISH_AVOID_BUDGET)  # {doc:{date:int重み}}
+
     # v6.5.0: schedule_rawが空の場合（新Excel構造）は空のDataFrameを使用
     if len(schedule_raw.columns) > 0:
         date_col_sched = schedule_raw.columns[0]
@@ -1736,6 +1844,8 @@ def run(input_path, output_dir=None, num_patterns=None):
         missing_avail_cols=_missing_avail_cols,
         travel_auto_ng=_travel_auto_ng,
         travel_partial=_travel_partial,
+        wish_marks=_wish_marks,
+        invalid_wish=_invalid_wish,
     )
 
     def prev_get(doc, colname):
@@ -3178,6 +3288,20 @@ def run(input_path, output_dir=None, num_patterns=None):
         soft_avoid_assignments = sum(
             assigned_count.get(d, 0) for d in doctor_names if d in SOFT_AVOID_SET)
 
+        # 希望ソフト制約 v1（避け）: 避けたい日に割り当てられた分の重み合計 + 実現率
+        wish_avoid_penalty = 0
+        wish_pref_realized = 0
+        wish_pref_total = 0
+        if WISH_WEIGHT:
+            for doc, wmap in WISH_WEIGHT.items():
+                assigned_dates = {dt for dt, _pre in dates_by_doc.get(doc, [])}
+                for dt, w in wmap.items():
+                    wish_pref_total += 1
+                    if dt in assigned_dates:
+                        wish_avoid_penalty += w  # 避けたい日に入った＝ペナルティ
+                    else:
+                        wish_pref_realized += 1   # 避けられた＝実現
+
         bk_ly_imbalance = 0
         for doc in active_doctors:
             if doc in RATIO_EXEMPT_DOCTORS:
@@ -3344,6 +3468,7 @@ def run(input_path, output_dir=None, num_patterns=None):
         penalty += max(0, ht_spread_fair - 1) * W_FAIR_CUM_HT  # 二層累計公平（外病院累計均等化）
         penalty += soft_avoid_assignments * W_SOFT_AVOID       # ソフト回避医師の割当
         penalty -= kate_weekday_matches * W_KATE_WEEKDAY_BONUS  # カテ番×平日大学一致は加点
+        penalty += wish_avoid_penalty                          # 希望(避け): 避け日に入るとペナルティ
 
         raw_score = 100 - penalty
         score = max(raw_score, 0)
@@ -3377,6 +3502,9 @@ def run(input_path, output_dir=None, num_patterns=None):
             "soft_avoid_assignments": int(soft_avoid_assignments),  # v6.12.0: ソフト回避医師の割当数
             "kate_weekday_matches": int(kate_weekday_matches),  # v6.12.0: カテ番×平日大学一致数
             "bk_ly_imbalance": int(bk_ly_imbalance),
+            "wish_avoid_penalty": int(wish_avoid_penalty),  # 希望(避け): 避け日に入った重み合計
+            "wish_pref_realized": int(wish_pref_realized),  # 避けが叶った日数
+            "wish_pref_total": int(wish_pref_total),        # 避け希望の総日数
         }
         return score, raw_score, metrics
 
@@ -3994,6 +4122,7 @@ def run(input_path, output_dir=None, num_patterns=None):
             {"項目": "--- ソフト層（v6.12.0） ---", "値": "", "説明": ""},
             {"項目": "ソフト回避医師の割当数", "値": int(metrics.get("soft_avoid_assignments", 0)), "説明": "SOFT_AVOID_DOCTORS該当医師の割当合計（1回ごとW_SOFT_AVOIDの軽ペナルティ）"},
             {"項目": "カテ番×平日大学一致", "値": int(metrics.get("kate_weekday_matches", 0)), "説明": "カテ当番日の平日大学枠(B/I-K)にカテ当番医師が入った数（W_KATE_WEEKDAY_BONUSで加点）"},
+            {"項目": "避け希望 実現", "値": f"{int(metrics.get('wish_pref_realized', 0))}/{int(metrics.get('wish_pref_total', 0))}", "説明": "「希望」シートの避けたい日のうち当直を回避できた日数/総日数（WISH_AVOID_BUDGET）"},
         ]
         return pd.DataFrame(rows)
 

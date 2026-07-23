@@ -84,6 +84,17 @@ python3 compare_schedules.py <当直くん.xlsx> <完成版.xlsx> --label-a 当�
 > 完成版は `pattern_01` シート（A1=`日付`・列並びは雛形 sheet1 と同じ）にするだけで突合対象になる。
 > 月次の運用フロー・フォルダ構成の詳細は **`docs/HEISOU_GUIDE.md`**。
 
+### 希望の収集・反映（Google Form）
+
+医局員の希望（避けたい/やりたい/当直不可）を Google Form で集め、入力に反映:
+
+```bash
+python3 build_wish_from_form.py <form_responses.csv> <入力.xlsx> -o <出力.xlsx>
+```
+
+> 「希望」シート（`×1〜×3`避け / `○1〜○3`やりたい）＋ `Sheet2` の `0`（不可）を自動生成。
+> 反映ロジックは `docs/WISH_CONSTRAINT_SPEC.md`、Form設計は `docs/WISH_FORM_DESIGN.md`。
+
 ### config.py の編集
 
 必要に応じて `config.py` を更新してください。

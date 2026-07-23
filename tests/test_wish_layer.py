@@ -96,13 +96,18 @@ def _by_slot(data, solution):
 # A. parse_wish_mark
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("value,expected", [
-    ("×1", 1), ("×2", 2), ("×3", 3),
-    ("×", 1), ("✕2", 2), ("x3", 3), ("X1", 1), ("　×2　", 2),
-    ("×4", None), ("×0", None), ("○1", None), ("1", None),
+    # 避け ×N → 負
+    ("×1", -1), ("×2", -2), ("×3", -3), ("×", -1), ("✕2", -2), ("x3", -3), ("X1", -1),
+    ("　×2　", -2),
+    # やりたい ○N → 正
+    ("○1", 1), ("○2", 2), ("○3", 3), ("○", 1), ("◯2", 2), ("〇3", 3), ("◎1", 1),
+    # 範囲外・非マーク → None
+    ("×4", None), ("×0", None), ("○4", None), ("1", None),
     (1, None), (2.0, None), ("", None), (None, None), ("あ", None),
 ])
 def test_parse_wish_mark(value, expected):
     assert solver_cpsat.parse_wish_mark(value) == expected
+    assert main_mod.parse_wish_mark(value) == expected  # 両実装が同一
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +124,8 @@ def test_wish_weights_normalization(tmp_path):
     path = str(build_wish_xlsx(tmp_path / "w.xlsx", ["医A", "医B", "医C"], dates,
                                {d: ["病院X"] for d in range(1, 15)}, wish=wish))
     data = solver_cpsat.InputData(path, verbose=False)
-    w = data.wish_weights(6)
-    # 医A: 1件に全予算 → 6
+    w = data.wish_weights(6, 0)  # 避け予算6・やりたい予算0
+    # 避けは正の重み。医A: 1件に全予算 → 6
     assert list(w["医A"].values()) == [6]
     # 医B: 6件に薄まる → 各 round(6*3/18)=1
     assert set(w["医B"].values()) == {1}
@@ -137,7 +142,23 @@ def test_wish_weights_budget_zero_is_empty(tmp_path):
     path = str(build_wish_xlsx(tmp_path / "z.xlsx", ["医A", "医B"], dates,
                                {2: ["病院X"], 6: ["病院X"]}, wish=wish))
     data = solver_cpsat.InputData(path, verbose=False)
-    assert data.wish_weights(0) == {}
+    assert data.wish_weights(0, 0) == {}
+
+
+def test_wish_weights_want_is_negative_and_separate_budget(tmp_path):
+    """やりたい(○)は負の重み。避けと別予算で各々正規化される。"""
+    dates = [datetime.datetime(2026, 3, d) for d in range(1, 10)]
+    # 医A: 避け×3(1日) + やりたい○3(2日)。別予算で正規化される
+    wish = {"医A": {2: "×3", 5: "○3", 6: "○3"}}
+    path = str(build_wish_xlsx(tmp_path / "wn.xlsx", ["医A", "医B"], dates,
+                               {d: ["病院X"] for d in range(1, 10)}, wish=wish))
+    data = solver_cpsat.InputData(path, verbose=False)
+    w = data.wish_weights(6, 6)
+    d2 = datetime.datetime(2026, 3, 2)
+    d5 = datetime.datetime(2026, 3, 5)
+    d6 = datetime.datetime(2026, 3, 6)
+    assert w["医A"][d2] == 6      # 避け1件に避け予算6
+    assert w["医A"][d5] == -3 and w["医A"][d6] == -3  # やりたい2件に予算6→各-3
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +178,36 @@ def test_cpsat_honors_feasible_avoid(tmp_path, monkeypatch):
     d6 = datetime.date(2026, 3, 6)
     assert by[(d2, "病院X")] == "医B", f"医Aが避けたい day2 に入っている: {by}"
     assert by[(d6, "病院X")] == "医A"
+
+
+def test_cpsat_honors_feasible_want(tmp_path, monkeypatch):
+    """医A が day2 をやりたい(○3) → 公平を崩さず day2 に医Aを入れられる。"""
+    dates = [datetime.datetime(2026, 3, d) for d in range(1, 8)]
+    slots = {2: ["病院X"], 6: ["病院X"]}       # 2枠・2医師 → 公平は1回ずつ
+    wish = {"医A": {2: "○3"}}
+    path = str(build_wish_xlsx(tmp_path / "want.xlsx", ["医A", "医B"], dates,
+                               slots, wish=wish))
+    monkeypatch.setattr(solver_cpsat, "WISH_WANT_BUDGET", 1000)  # soft帯で支配的
+    data, sols = solver_cpsat.solve(path, n_solutions=1, verbose=False)
+    by = _by_slot(data, sols[0])
+    d2 = datetime.date(2026, 3, 2)
+    assert by[(d2, "病院X")] == "医A", f"医Aが希望した day2 に入っていない: {by}"
+
+
+def test_cpsat_want_does_not_increase_total(tmp_path, monkeypatch):
+    """やりたいは総数を増やさない（クォータ固定内での振替）。3枠3医師で各1回のまま。"""
+    dates = [datetime.datetime(2026, 3, d) for d in range(1, 12)]
+    slots = {2: ["病院X"], 6: ["病院Y"], 10: ["病院Z"]}
+    # 医A が全枠をやりたい(○3)としても、総数は1回に固定される
+    wish = {"医A": {2: "○3", 6: "○3", 10: "○3"}}
+    path = str(build_wish_xlsx(tmp_path / "wtot.xlsx", ["医A", "医B", "医C"], dates,
+                               slots, wish=wish))
+    monkeypatch.setattr(solver_cpsat, "WISH_WANT_BUDGET", 1000)
+    data, sols = solver_cpsat.solve(path, n_solutions=1, verbose=False)
+    total = {}
+    for si, doc in sols[0]["assign"].items():
+        total[doc] = total.get(doc, 0) + 1
+    assert total.get("医A", 0) == 1, f"やりたいで総数が増えた: {total}"
 
 
 def test_cpsat_wish_cannot_override_feasibility(tmp_path, monkeypatch):
@@ -199,32 +250,33 @@ def test_main_and_cpsat_parse_wish_identically(tmp_path):
     """main.py と solver_cpsat.py が同じ希望シートから同じ重みを出す（二重パース整合）。"""
     dates = [datetime.datetime(2026, 3, d) for d in range(1, 15)]
     wish = {
-        "医A": {2: "×3"},
+        "医A": {2: "×3", 7: "○2"},
         "医B": {d: "×2" for d in (3, 4, 5)},
-        "医C": {6: "×1", 9: "×3"},
+        "医C": {6: "○1", 9: "×3"},
     }
     path = str(build_wish_xlsx(tmp_path / "cons.xlsx", ["医A", "医B", "医C"], dates,
                                {d: ["病院X"] for d in range(1, 15)}, wish=wish))
     # main.py 経路
     xls = pd.ExcelFile(path)
     marks, invalid = main_mod.parse_wish_sheet(xls)
-    main_w = main_mod.wish_day_weights(marks, 6)
+    main_w = main_mod.wish_signed_weights(marks, 6, 6)
     # solver_cpsat 経路
     data = solver_cpsat.InputData(path, verbose=False)
-    cp_w = data.wish_weights(6)
+    cp_w = data.wish_weights(6, 6)
     assert invalid == []
     assert main_w == cp_w and main_w != {}
 
 
 def test_main_parse_wish_flags_invalid(tmp_path):
     dates = [datetime.datetime(2026, 3, d) for d in range(1, 8)]
-    wish = {"医A": {2: "×3", 3: "×5", 4: "○1"}}  # ×5 と ○1 は不正
+    wish = {"医A": {2: "×3", 3: "×5", 4: "○2", 5: "△1"}}  # ×5 と △1 は不正
     path = str(build_wish_xlsx(tmp_path / "inv.xlsx", ["医A", "医B"], dates,
                                {2: ["病院X"]}, wish=wish))
     xls = pd.ExcelFile(path)
     marks, invalid = main_mod.parse_wish_sheet(xls)
-    assert marks == {"医A": {pd.Timestamp(2026, 3, 2): 3}}
-    assert len(invalid) == 2  # ×5 と ○1
+    # ×3→-3, ○2→+2 は有効
+    assert marks == {"医A": {pd.Timestamp(2026, 3, 2): -3, pd.Timestamp(2026, 3, 4): 2}}
+    assert len(invalid) == 2  # ×5 と △1
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +294,8 @@ E2E_SLOTS = {
 def test_main_run_greedy_with_wish_pipeline(tmp_path):
     """Greedy経路: 希望シート付きで完走し、プリフライト警告とサマリー行が出る。"""
     dates = [datetime.datetime(2026, 3, d) for d in range(1, 29)]
-    # 有効な避け(医A ×3) + 不正マーク(×5) + 名簿に無い列
-    wish = {"医A": {2: "×3", 9: "×5"}, "医Z不在": {3: "×1"}}
+    # 避け(×3) + やりたい(○2) + 不正マーク(×5) + 名簿に無い列
+    wish = {"医A": {2: "×3", 4: "○2", 9: "×5"}, "医Z不在": {3: "×1"}}
     input_path = str(build_wish_xlsx(tmp_path / "e2e.xlsx", E2E_DOCTORS, dates,
                                      E2E_SLOTS, wish=wish))
     out_dir = str(tmp_path / "out")
@@ -266,3 +318,4 @@ def test_main_run_greedy_with_wish_pipeline(tmp_path):
              for c in row if isinstance(c, str)]
     wb.close()
     assert any("避け希望 実現" in c for c in cells), "サマリーに避け希望の実現行が無い"
+    assert any("やりたい希望 実現" in c for c in cells), "サマリーにやりたい希望の実現行が無い"

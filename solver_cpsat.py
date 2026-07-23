@@ -97,7 +97,8 @@ try:
     SOFT_AVOID_DOCTORS = list(getattr(_cfg, "SOFT_AVOID_DOCTORS", []) or [])
     W_SOFT_AVOID = getattr(_cfg, "W_SOFT_AVOID", 15)
     W_KATE_WEEKDAY_BONUS = getattr(_cfg, "W_KATE_WEEKDAY_BONUS", 0)
-    WISH_AVOID_BUDGET = getattr(_cfg, "WISH_AVOID_BUDGET", 0)  # 希望ソフト制約v1（避け予算）
+    WISH_AVOID_BUDGET = getattr(_cfg, "WISH_AVOID_BUDGET", 0)  # 希望: 避け予算
+    WISH_WANT_BUDGET = getattr(_cfg, "WISH_WANT_BUDGET", 0)    # 希望: やりたい予算(v2)
 except Exception:
     WED_FORBIDDEN_DEFAULT = ["金城", "山田", "野寺"]
     CFG_HOLIDAYS = []
@@ -110,6 +111,7 @@ except Exception:
     W_SOFT_AVOID = 15
     W_KATE_WEEKDAY_BONUS = 0
     WISH_AVOID_BUDGET = 0
+    WISH_WANT_BUDGET = 0
 
 
 # =========================
@@ -171,15 +173,15 @@ def is_slot_value(v):
     return False
 
 
-# 希望シートの避けマーク記号（×1/×2/×3 等）
-_WISH_MARK_HEADS = ("×", "✕", "✗", "x", "X", "ｘ", "Ｘ")
+# 希望シートのマーク記号: ×N=避け（負）/ ○N=やりたい（正）
+_WISH_AVOID_HEADS = ("×", "✕", "✗", "x", "X", "ｘ", "Ｘ")
+_WISH_WANT_HEADS = ("○", "◯", "〇", "◎")
 
 
 def parse_wish_mark(v):
-    """希望シートのセルを避け段階(1-3)に変換。
+    """希望シートのセルを符号付き段階に変換。避け ×N→ -N / やりたい ○N→ +N（|N|=1..3）。
 
-    `×1` `×2` `×3`（記号のみ `×`＝段階1、全角/半角xも許容）→ 1..3。
-    希望なし（空欄・数値のみ）や範囲外(×4以上)は None（数値のみは曖昧なので不採用）。
+    記号のみ（`×`/`○`）は段階1。希望なし（空欄・数値のみ）や範囲外(×4以上)は None。
     main.py 側と完全同一ロジック（二重パースの整合のため）。
     """
     if v is None:
@@ -187,16 +189,52 @@ def parse_wish_mark(v):
     if isinstance(v, (int, float, np.integer, np.floating)):
         return None
     s = str(v).strip()
-    if not s or s[0] not in _WISH_MARK_HEADS:
+    if not s:
+        return None
+    head = s[0]
+    if head in _WISH_AVOID_HEADS:
+        sign = -1
+    elif head in _WISH_WANT_HEADS:
+        sign = 1
+    else:
         return None
     rest = s[1:].strip()
     if rest == "":
-        return 1
+        return sign
     try:
         stage = int(float(rest))
     except ValueError:
         return None
-    return stage if 1 <= stage <= 3 else None
+    return sign * stage if 1 <= stage <= 3 else None
+
+
+def wish_signed_weights(marks, avoid_budget, want_budget):
+    """符号付きマーク {doc:{date: ±段階}} → {doc:{date: int重み}}。
+
+    正の重み=避けペナルティ（避け日に割当で加算）／負の重み=やりたい加点。
+    避け・やりたいは別予算・各々「その医師の段階合計」で正規化（多いほど薄まる）。
+    main.py 側と完全同一ロジック（二重パースの整合のため）。
+    """
+    out = {}
+    for d, dm in (marks or {}).items():
+        avoid = {dt: -st for dt, st in dm.items() if st < 0}  # 避け段階を正値化
+        want = {dt: st for dt, st in dm.items() if st > 0}
+        wd = {}
+        sa = sum(avoid.values())
+        if avoid_budget > 0 and sa > 0:
+            for dt, st in avoid.items():
+                w = int(round(avoid_budget * st / sa))
+                if w > 0:
+                    wd[dt] = w
+        sw = sum(want.values())
+        if want_budget > 0 and sw > 0:
+            for dt, st in want.items():
+                w = int(round(want_budget * st / sw))
+                if w > 0:
+                    wd[dt] = -w  # 加点は負符号（MINIMIZEで希望日へ引き寄せ）
+        if wd:
+            out[d] = wd
+    return out
 
 
 def norm_date(d):
@@ -752,7 +790,7 @@ class InputData:
         return code
 
     def wish_stage(self, date, doc):
-        """希望シートの避け段階(1-3)。希望なし/不正/シート無しは0。"""
+        """希望シートの符号付き段階（避け -1..-3 / やりたい +1..+3）。無し/不正は0。"""
         if not self.wish_col_of:
             return 0
         col = self.wish_col_of.get(doc)
@@ -768,7 +806,7 @@ class InputData:
         return parse_wish_mark(v) or 0
 
     def _collect_wish_marks(self):
-        """医師→{date: 避け段階(1-3)}。予算に依存しない生の希望マーク（無ければ空）。"""
+        """医師→{date: 符号付き段階}。予算非依存の生マーク（避け負・やりたい正・無ければ空）。"""
         marks = {}
         if not self.wish_col_of:
             return marks
@@ -782,24 +820,13 @@ class InputData:
                 marks[d] = dd
         return marks
 
-    def wish_weights(self, budget):
-        """避け予算を段階合計で正規化した 医師→{date: int重み}。
+    def wish_weights(self, avoid_budget, want_budget):
+        """符号付きマーク → 医師→{date: int重み}。正=避けペナルティ / 負=やりたい加点。
 
-        重み = round(budget × 段階 / Σ段階)。多く出すほど1件が薄まる（0は捨てる）。
-        budget は build 時に読む（テスト monkeypatch 対応）。main.py 側と同一ロジック。
+        避け・やりたいで別予算・各々段階合計で正規化（多く出すほど薄まる）。
+        budget は build 時に読む（テスト monkeypatch 対応）。main.py と同一ロジック。
         """
-        out = {}
-        if budget <= 0:
-            return out
-        for d, marks in (self.wish_marks or {}).items():
-            total = sum(marks.values())
-            if total <= 0:
-                continue
-            wd = {dt: int(round(budget * st / total)) for dt, st in marks.items()}
-            wd = {dt: w for dt, w in wd.items() if w > 0}
-            if wd:
-                out[d] = wd
-        return out
+        return wish_signed_weights(self.wish_marks, avoid_budget, want_budget)
 
     # ---- カテ表コード（main.py get_sched_code の新構造分） ----
     def sched_code(self, date, doc):
@@ -1279,12 +1306,12 @@ class CpSatScheduler:
                 if d in avoid_set and cnt_terms[d]:
                     soft_terms.append(W_SOFT_AVOID * sum(cnt_terms[d]))
 
-        # --- 希望ソフト制約 v1（避け専用・日単位・予算正規化） ---
-        # 避けたい日に割り当てられると軽ペナルティ（正符号=MINIMIZEで回避方向）。
-        # 重みは予算B×段階/段階合計を整数化した wish_weight（多く出すほど薄まる）。
-        # 固定枠は動かせないので自由枠(day_terms)のみ対象。公平(W_FAIR=1e5)には勝てない。
-        if WISH_AVOID_BUDGET > 0 and getattr(data, "wish_marks", None):
-            wish_w = data.wish_weights(WISH_AVOID_BUDGET)
+        # --- 希望ソフト制約（日単位・予算正規化）: 避け×N / やりたい○N ---
+        # 符号付き重み: 正=避け日に割当でペナルティ / 負=希望日に割当で加点（MINIMIZEで引き寄せ）。
+        # 予算B×段階/段階合計を整数化（多く出すほど薄まる）。固定枠は動かせないので自由枠のみ。
+        # 重みは公平(W_FAIR=1e5)より遥かに小さく＝休日↔休日の振替でのみ効く（総数不変）。
+        if (WISH_AVOID_BUDGET > 0 or WISH_WANT_BUDGET > 0) and getattr(data, "wish_marks", None):
+            wish_w = data.wish_weights(WISH_AVOID_BUDGET, WISH_WANT_BUDGET)
             for d in docs:
                 wmap = wish_w.get(d)
                 if not wmap:
